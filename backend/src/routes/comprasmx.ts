@@ -24,7 +24,7 @@ function firstQueryString(q: unknown): string | undefined {
   return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
 }
 
-/** `undefined` si no viene query → usa reglas por defecto del servicio (dev = visible). */
+/** `undefined` si no viene query → headless por defecto en el servicio. */
 function parseHeadedQuery(q: unknown): boolean | undefined {
   const raw = Array.isArray(q) ? q[0] : q;
   if (typeof raw !== "string") return undefined;
@@ -119,23 +119,8 @@ comprasmxRouter.post("/snapshot", async (req: Request, res: Response, next: Next
       ...(headedExplicit !== undefined ? { headed: headedExplicit } : {}),
       ...(fechas ? { fechaPublicacionDesde: fechas.desde, fechaPublicacionHasta: fechas.hasta } : {}),
       ...(entidadesParsed.values ? { entidadesFederativas: entidadesParsed.values } : {}),
+      ...(palabrasClave ? { palabrasClave } : {}),
     });
-
-    if (palabrasClave && palabrasClave.length > 0) {
-      const kws = palabrasClave.map((k) => k.toLowerCase());
-      const filasFiltradas = data.filas.filter((fila) => {
-        const nombre = fila.nombre.toLowerCase();
-        return kws.some((kw) => nombre.includes(kw));
-      });
-      res.json({
-        ...data,
-        filtros: { ...data.filtros, palabrasClave },
-        filas: filasFiltradas,
-        totalFilas: filasFiltradas.length,
-      });
-      return;
-    }
-
     res.json(data);
   } catch (err) {
     next(err);

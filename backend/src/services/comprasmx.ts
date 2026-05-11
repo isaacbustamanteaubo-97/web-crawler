@@ -4,6 +4,16 @@ const SOURCE_URL =
   "https://comprasmx.buengobierno.gob.mx/sitiopublico/#/";
 const TZ = "America/Mexico_City";
 
+/** Máximo de páginas de detalle `/procedimiento` a abrir por petición cuando hay `palabrasClave`. */
+export const DEFAULT_MAX_PROCEDIMIENTO_DETALLE = 25;
+
+function maxProcedimientoDetalle(): number {
+  const raw = process.env.COMPRASMX_MAX_PROCEDIMIENTO_DETALLE?.trim();
+  const n = raw ? parseInt(raw, 10) : DEFAULT_MAX_PROCEDIMIENTO_DETALLE;
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MAX_PROCEDIMIENTO_DETALLE;
+  return Math.min(n, 100);
+}
+
 /** Evita dos snapshots a la vez (misma CPU, timeouts y estado del SPA → respuestas distintas). */
 let snapshotRunLock: Promise<unknown> = Promise.resolve();
 
@@ -73,9 +83,35 @@ export function parseEntidadesFederativasCliente(raw: unknown): { values?: strin
   return { values: out };
 }
 
+export type ComprasmxAnexo = {
+  titulo: string;
+  urlDescarga: string;
+};
+
+export type ComprasmxDetalleProcedimiento = {
+  numeroProcedimientoContratacion: string | null;
+  datosGenerales: {
+    dependenciaOEntidad: string | null;
+    descripcionDetallada: string | null;
+    nombreProcedimiento: string | null;
+  };
+  cronograma: {
+    presentacionAperturaProposiciones: string | null;
+    limiteAclaracionesComprasmx: string | null;
+    aplicaJuntaAclaraciones: string | null;
+    fechaHoraActoFallo: string | null;
+  };
+  entidadFederativaContratacion: string | null;
+  anexos: ComprasmxAnexo[];
+  error?: string;
+};
+
 export type ComprasmxFila = {
   numeroIdentificacion: string;
   nombre: string;
+  /** URL absoluta del detalle (columna expediente / número de identificación), si existe enlace. */
+  urlProcedimiento?: string;
+  detalleProcedimiento?: ComprasmxDetalleProcedimiento;
 };
 
 export type ComprasmxSnapshot = {
@@ -87,6 +123,14 @@ export type ComprasmxSnapshot = {
     entidadesFederativas: string[];
     /** Pestaña de resultados usada antes de aplicar filtros (`COMPRASMX_TAB`) */
     pestanaResultados: "vigentes" | "seguimiento" | "concluidos";
+    /** Solo cuando el cliente envía palabras clave: filas devueltas = coincidencias (hasta el límite de detalle). */
+    palabrasClave?: string[];
+    /** Límite aplicado al abrir vistas de detalle (por defecto 25, `COMPRASMX_MAX_PROCEDIMIENTO_DETALLE`). */
+    detalleProcedimientoMax?: number;
+    /** Filas del listado cuyo nombre coincide con alguna palabra clave (antes del recorte por límite). */
+    coincidenciasListadoKeyword?: number;
+    /** Coincidencias que no se procesaron por superar el límite. */
+    detallesOmitidosPorLimite?: number;
   };
   /** Valores de los inputs de fecha antes de Buscar (si están vacíos, el filtro de publicación no se aplicará). */
   valoresFormularioDetectados: {
@@ -295,7 +339,7 @@ async function limpiarFormularioFiltros(page: Page): Promise<void> {
   const btn = page.getByRole("button", { name: /^limpiar$/i }).first();
   if (await btn.isVisible().catch(() => false)) {
     await btn.click();
-    await delay(1000);
+    await delay(fastMode() ? 550 : 1000);
   }
 }
 
@@ -338,12 +382,12 @@ async function esperarRespuestaBusqueda(
         Number.isFinite(totalPieAntes) &&
         totalPie === totalPieAntes
       ) {
-        await delay(450);
+        await delay(250);
         continue;
       }
 
       // Estabilidad: intentamos leer "Total" dos veces para evitar valores parciales.
-      await delay(500);
+      await delay(fastMode() ? 280 : 500);
       const total2 = await leerTotalPiePortal(page);
       if (total2 !== null && total2 === totalPie) {
         return { totalPie, sinResultados: false };
@@ -447,24 +491,25 @@ async function abrirPanelFiltros(page: Page): Promise<void> {
   const filtros = page.getByRole("button", { name: /filtros/i }).first();
   await filtros.waitFor({ state: "visible", timeout: 90_000 });
   const fechaInput = page.locator('input[name="fechaDesdeP"]');
+  const panelPause = fastMode() ? 900 : 1600;
   if (!(await fechaInput.isVisible().catch(() => false))) {
     await filtros.click();
-    await delay(1600);
+    await delay(panelPause);
   }
   if (!(await fechaInput.isVisible().catch(() => false))) {
     await filtros.click();
-    await delay(1600);
+    await delay(panelPause);
   }
   await fechaInput.waitFor({ state: "visible", timeout: 60_000 });
 }
 
 async function cerrarOverlayMultiselect(page: Page, multiselect: ReturnType<Page["locator"]>): Promise<void> {
   await page.keyboard.press("Escape");
-  await delay(350);
+  await delay(fastMode() ? 200 : 350);
   await multiselect.locator(".p-multiselect").click();
-  await delay(250);
+  await delay(fastMode() ? 120 : 250);
   await page.keyboard.press("Escape");
-  await delay(450);
+  await delay(fastMode() ? 200 : 450);
 }
 
 /**
@@ -520,10 +565,13 @@ const EXTRACT_FILAS_UI_SCRIPT = `(() => {
   var trs = table.querySelectorAll("tbody tr");
   for (var j = 0; j < trs.length; j++) {
     var tr = trs[j];
-    var cells = Array.from(tr.querySelectorAll("td")).map(function (td) { return norm(td.textContent || ""); });
+    var tds = tr.querySelectorAll("td");
+    var cells = Array.from(tds).map(function (td) { return norm(td.textContent || ""); });
     var numeroIdentificacion = cells[idxNum] || "";
     var nombre = cells[idxNombre] || "";
-    if (numeroIdentificacion !== "" || nombre !== "") filas.push({ numeroIdentificacion: numeroIdentificacion, nombre: nombre });
+    if (numeroIdentificacion !== "" || nombre !== "") {
+      filas.push({ numeroIdentificacion: numeroIdentificacion, nombre: nombre });
+    }
   }
   return filas;
 })()`;
@@ -532,10 +580,403 @@ function extraerFilasNumeroyNombre(page: Pick<Page, "evaluate">): Promise<Compra
   return page.evaluate(EXTRACT_FILAS_UI_SCRIPT);
 }
 
+/**
+ * Clic en el expediente del listado: suele abrir una nueva pestaña; si no, navega en la misma ventana.
+ * `COMPRASMX_PROCEDIMIENTO_POPUP_TIMEOUT_MS`: tiempo máximo a esperar la nueva pestaña (por defecto 15000).
+ */
+async function abrirDetalleProcedimientoDesdeListado(
+  listPage: Page,
+  numeroIdentificacion: string,
+  popupTimeoutMs: number,
+  navTimeoutMs: number,
+): Promise<{ detailPage: Page; mode: "popup" | "same" }> {
+  const ident = numeroIdentificacion.trim();
+  if (!ident) throw new Error("Sin número de identificación");
+
+  const row = listPage.locator("tbody tr").filter({ hasText: ident }).first();
+  await row.waitFor({ state: "visible", timeout: navTimeoutMs });
+
+  const link = row.getByRole("link", { name: new RegExp(`^${escapeRegex(ident)}$`, "i") });
+  const clickTarget =
+    (await link.count()) > 0
+      ? link.first()
+      : row.locator("td").filter({ hasText: new RegExp(`^\\s*${escapeRegex(ident)}\\s*$`, "i") }).first();
+
+  await clickTarget.scrollIntoViewIfNeeded({ timeout: 15_000 }).catch(() => {});
+
+  const ctx = listPage.context();
+  let detailPage: Page;
+  let mode: "popup" | "same";
+  try {
+    const [np] = await Promise.all([
+      ctx.waitForEvent("page", { timeout: popupTimeoutMs }),
+      clickTarget.click({ timeout: 15_000 }),
+    ]);
+    detailPage = np;
+    mode = "popup";
+    await detailPage.waitForLoadState("domcontentloaded", { timeout: navTimeoutMs }).catch(() => {});
+    await instalarBloqueoRecursosLigeros(detailPage);
+    detailPage.setDefaultTimeout(navTimeoutMs);
+    detailPage.setDefaultNavigationTimeout(navTimeoutMs);
+  } catch {
+    await listPage.waitForURL(/procedimiento/i, { timeout: navTimeoutMs });
+    detailPage = listPage;
+    mode = "same";
+    await listPage.waitForLoadState("domcontentloaded", { timeout: navTimeoutMs }).catch(() => {});
+  }
+  return { detailPage, mode };
+}
+
+async function cerrarDetalleYLiberarListado(listPage: Page, detailPage: Page, mode: "popup" | "same"): Promise<void> {
+  if (mode === "popup") {
+    await detailPage.close().catch(() => {});
+    await listPage.bringToFront().catch(() => {});
+    await delay(fastMode() ? 200 : 400);
+    return;
+  }
+  await listPage.goBack({ waitUntil: "domcontentloaded" }).catch(() => {});
+  await delay(fastMode() ? 500 : 900);
+  await listPage.locator("tbody tr").first().waitFor({ state: "visible", timeout: 30_000 }).catch(() => {});
+}
+
+function detalleProcedimientoVacio(): ComprasmxDetalleProcedimiento {
+  return {
+    numeroProcedimientoContratacion: null,
+    datosGenerales: {
+      dependenciaOEntidad: null,
+      descripcionDetallada: null,
+      nombreProcedimiento: null,
+    },
+    cronograma: {
+      presentacionAperturaProposiciones: null,
+      limiteAclaracionesComprasmx: null,
+      aplicaJuntaAclaraciones: null,
+      fechaHoraActoFallo: null,
+    },
+    entidadFederativaContratacion: null,
+    anexos: [],
+  };
+}
+
+type RawDetalleProcedimiento = {
+  numeroProcedimientoContratacion: string | null;
+  dependenciaOEntidad: string | null;
+  descripcionDetallada: string | null;
+  nombreProcedimiento: string | null;
+  presentacionAperturaProposiciones: string | null;
+  limiteAclaracionesComprasmx: string | null;
+  aplicaJuntaAclaraciones: string | null;
+  fechaHoraActoFallo: string | null;
+  entidadFederativaContratacion: string | null;
+  anexos: ComprasmxAnexo[];
+};
+
+const EXTRACT_PROCEDIMIENTO_UI_SCRIPT = `(() => {
+  function norm(s) { return (s || "").replace(/\\s+/g, " ").trim(); }
+  function nfd(s) {
+    return norm(s)
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\\u0300-\\u036f]/g, "");
+  }
+  var root =
+    document.querySelector("[class*='detalle']") ||
+    document.querySelector(".layout-content") ||
+    document.querySelector(".layout-main") ||
+    document.querySelector("main") ||
+    document.querySelector("app-root") ||
+    document.body;
+  var pairs = [];
+
+  function addPair(k, v) {
+    k = norm(k);
+    v = norm(v);
+    if (!k || k.length > 320) return;
+    if (!v) return;
+    pairs.push({ k: k, v: v });
+  }
+
+  function looksLikeSectionHeader(label) {
+    var n = nfd(label);
+    if (n.length < 6) return true;
+    if (n.indexOf("datos generales") >= 0 && n.length < 22) return true;
+    if (n.indexOf("datos del ente") >= 0) return true;
+    if (n.indexOf("unidades requirentes") >= 0) return true;
+    if (n.indexOf("cronograma") >= 0 && n.indexOf("evento") >= 0) return true;
+    if (n === "cronograma de eventos") return true;
+    if (n.indexOf("anexos") >= 0 && n.length < 20) return true;
+    if (n.indexOf("partidas especificas") >= 0 || n.indexOf("partidas específicas") >= 0) return true;
+    if (label.length > 6 && label === label.toUpperCase() && label.length < 55 && label.indexOf(" ") > 0) return true;
+    return false;
+  }
+
+  function looksLikeNewFieldLine(rawLine) {
+    var t = norm(rawLine);
+    var ix = t.indexOf(":");
+    if (ix < 12 || ix > 140) return false;
+    var left = norm(t.slice(0, ix));
+    if (left.length < 10 || left.length > 130) return false;
+    if (looksLikeSectionHeader(left)) return true;
+    var right = norm(t.slice(ix + 1));
+    return right.length >= 1;
+  }
+
+  function collectColonPairsFromInnerText(el) {
+    if (!el) return;
+    var raw = el.innerText || "";
+    var parts = raw.split(/\\r?\\n/);
+    for (var i = 0; i < parts.length; i++) {
+      var line = norm(parts[i]);
+      if (!line) continue;
+      var ix = line.indexOf(":");
+      if (ix <= 0 || ix > 150) continue;
+      var label = norm(line.slice(0, ix)).replace(/:\\s*$/g, "");
+      if (!label || looksLikeSectionHeader(label)) continue;
+      var rightSame = norm(line.slice(ix + 1));
+      if (rightSame.length >= 2) {
+        addPair(label, rightSame);
+        continue;
+      }
+      var buf = [];
+      for (var j = i + 1; j < parts.length && j < i + 45; j++) {
+        if (looksLikeNewFieldLine(parts[j])) break;
+        var nxt = norm(parts[j]);
+        if (!nxt) continue;
+        buf.push(nxt);
+      }
+      var merged = norm(buf.join(" "));
+      if (merged.length > 2) addPair(label, merged);
+      i += buf.length;
+    }
+  }
+
+  function collectFlexLabelBlocks(el) {
+    if (!el) return;
+    Array.from(el.querySelectorAll("div, section, article")).forEach(function (box) {
+      if (!box || !box.children || box.children.length < 2) return;
+      var ch = Array.from(box.children);
+      if (ch.length > 6) return;
+      var t0 = norm(ch[0].textContent || "");
+      if (!t0 || t0.length < 8 || t0.length > 140) return;
+      if (t0.indexOf(":") >= 0) return;
+      if (looksLikeSectionHeader(t0)) return;
+      var rest = norm(
+        ch
+          .slice(1)
+          .map(function (c) { return c.textContent || ""; })
+          .join(" "),
+      );
+      if (rest.length < 3 || rest.length > 4000) return;
+      if (nfd(t0).indexOf("dependencia") >= 0 || nfd(t0).indexOf("nombre del procedimiento") >= 0 || nfd(t0).indexOf("descripcion") >= 0) {
+        addPair(t0, rest);
+      }
+    });
+  }
+
+  if (root) {
+    collectColonPairsFromInnerText(root);
+    collectFlexLabelBlocks(root);
+
+    Array.from(root.querySelectorAll("table tr")).forEach(function (tr) {
+      var cells = tr.querySelectorAll("td, th");
+      if (cells.length >= 2) {
+        addPair(
+          cells[0].textContent,
+          Array.from(cells)
+            .slice(1)
+            .map(function (c) { return c.textContent || ""; })
+            .join(" "),
+        );
+      }
+    });
+
+    Array.from(root.querySelectorAll("dl")).forEach(function (dl) {
+      var ch = Array.from(dl.children);
+      for (var i = 0; i < ch.length; i++) {
+        if (ch[i].tagName !== "DT") continue;
+        var vals = [];
+        for (var j = i + 1; j < ch.length; j++) {
+          if (ch[j].tagName === "DD") vals.push(ch[j].textContent || "");
+          else if (ch[j].tagName === "DT") break;
+        }
+        if (vals.length) addPair(ch[i].textContent, vals.join(" "));
+      }
+    });
+
+    Array.from(root.querySelectorAll(".p-field, .field")).forEach(function (row) {
+      var lab = row.querySelector("label, .label, span.p-float-label > label");
+      var inp = row.querySelector("input, textarea, .p-inputtext, .p-inputtextarea");
+      if (lab && inp) addPair(lab.textContent || "", inp.value || inp.textContent || "");
+    });
+
+    Array.from(root.querySelectorAll(".grid .col-12, .grid .col-6, .grid .col-4, .grid .col-8")).forEach(function (col) {
+      var strong = col.querySelector("strong, b, label, .font-bold");
+      if (!strong) return;
+      var k = norm(strong.textContent || "");
+      if (!k || k.length > 200) return;
+      var clone = col.cloneNode(true);
+      var sr = clone.querySelector("strong, b, label, .font-bold");
+      if (sr) sr.remove();
+      var v = norm(clone.textContent || "");
+      if (v && v.length > 0 && v.length < 4000) addPair(k, v);
+    });
+  }
+
+  var blob = norm((root && root.innerText) || "");
+  var lines = blob.split(/\\n+/).map(norm).filter(function (x) { return x.length > 0; });
+
+  function pickLine(needles) {
+    var nn = needles.map(nfd);
+    for (var l = 0; l < lines.length; l++) {
+      var cur = nfd(lines[l]);
+      for (var j = 0; j < nn.length; j++) {
+        if (cur.indexOf(nn[j]) < 0) continue;
+        var ix = lines[l].indexOf(":");
+        if (ix >= 0) {
+          var after = norm(lines[l].slice(ix + 1));
+          if (after.length > 1) return after;
+        }
+        for (var k = l + 1; k < lines.length && k < l + 12; k++) {
+          var cand = lines[k];
+          var candN = nfd(cand);
+          var isLabel = false;
+          for (var z = 0; z < nn.length; z++) {
+            if (candN.indexOf(nn[z]) >= 0 && cand.length < 140) {
+              isLabel = true;
+              break;
+            }
+          }
+          if (isLabel) continue;
+          if (looksLikeNewFieldLine(cand)) break;
+          if (cand.length > 2) return cand.length > 800 ? cand.slice(0, 800) : cand;
+        }
+      }
+    }
+    return null;
+  }
+
+  function pick(pairs, needles) {
+    var nneedles = needles.map(nfd);
+    for (var i = 0; i < pairs.length; i++) {
+      var kn = nfd(pairs[i].k);
+      for (var j = 0; j < nneedles.length; j++) {
+        if (kn.indexOf(nneedles[j]) >= 0) return pairs[i].v || null;
+      }
+    }
+    return pickLine(needles);
+  }
+
+  var anexos = [];
+  var seen = {};
+  function pushAnexo(tit, href) {
+    if (!href || href === "#") return;
+    if (href.toLowerCase().indexOf("javascript:") === 0) return;
+    var abs = "";
+    try {
+      abs = new URL(href, location.href).href;
+    } catch (e) {
+      return;
+    }
+    if (abs.indexOf("comprasmx.buengobierno.gob.mx") < 0) return;
+    var t = norm(tit) || abs.split("/").pop().split("?")[0];
+    if (seen[abs]) return;
+    seen[abs] = 1;
+    anexos.push({ titulo: t, urlDescarga: abs });
+  }
+
+  if (root) {
+    var headings = root.querySelectorAll("h2, h3, h4, .p-panel-title, legend, .p-fieldset-legend");
+    for (var h = 0; h < headings.length; h++) {
+      var ht = norm(headings[h].textContent || "");
+      if (!ht) continue;
+      if (nfd(ht).indexOf("anexo") < 0) continue;
+      var scope = headings[h].closest(".p-panel, .p-fieldset, .p-card, .card, section") || root;
+      Array.from(scope.querySelectorAll("a[href]")).forEach(function (a) {
+        pushAnexo(a.textContent || "", a.getAttribute("href") || "");
+      });
+      break;
+    }
+    if (anexos.length === 0) {
+      Array.from(root.querySelectorAll("a[href]")).forEach(function (a) {
+        var href = (a.getAttribute("href") || "").trim();
+        var lo = href.toLowerCase();
+        if (lo.indexOf(".pdf") >= 0 || lo.indexOf("download") >= 0 || lo.indexOf("anexo") >= 0 || lo.indexOf("archivo") >= 0) {
+          pushAnexo(a.textContent || "", href);
+        }
+      });
+    }
+  }
+
+  return {
+    numeroProcedimientoContratacion: pick(pairs, [
+      "número de procedimiento de contratación",
+      "numero de procedimiento de contratacion",
+    ]),
+    dependenciaOEntidad: pick(pairs, ["dependencia o entidad", "ente contratante"]),
+    descripcionDetallada: pick(pairs, [
+      "descripción detallada del procedimiento de contratación",
+      "descripcion detallada del procedimiento de contratacion",
+    ]),
+    nombreProcedimiento: pick(pairs, [
+      "nombre del procedimiento de contratación",
+      "nombre del procedimiento de contratacion",
+    ]),
+    presentacionAperturaProposiciones: pick(pairs, [
+      "fecha y hora de presentación y apertura de proposiciones",
+      "fecha y hora de presentacion y apertura de proposiciones",
+      "presentacion y apertura de proposiciones",
+    ]),
+    limiteAclaracionesComprasmx: pick(pairs, [
+      "fecha y hora límite para envío de aclaraciones",
+      "fecha y hora limite para envio de aclaraciones",
+      "aclaraciones a través de compras mx",
+      "aclaraciones a traves de compras mx",
+    ]),
+    aplicaJuntaAclaraciones: pick(pairs, ["aplica junta de aclaraciones", "junta de aclaraciones"]),
+    fechaHoraActoFallo: pick(pairs, ["fecha y hora del acto del fallo", "acto del fallo"]),
+    entidadFederativaContratacion: pick(pairs, [
+      "entidad federativa donde se llevará a cabo la contratación",
+      "entidad federativa donde se llevara a cabo la contratacion",
+    ]),
+    anexos: anexos,
+  };
+})()`;
+
+async function extraerDetalleProcedimientoDesdePage(page: Page): Promise<ComprasmxDetalleProcedimiento> {
+  try {
+    await page.locator(".layout-main, main, app-root").first().waitFor({ state: "visible", timeout: 20_000 }).catch(() => {});
+    await page.waitForLoadState("networkidle", { timeout: 12_000 }).catch(() => {});
+    await delay(fastMode() ? 500 : 1100);
+    const raw = (await page.evaluate(EXTRACT_PROCEDIMIENTO_UI_SCRIPT)) as RawDetalleProcedimiento;
+    const anexos = Array.isArray(raw?.anexos) ? raw.anexos : [];
+    return {
+      numeroProcedimientoContratacion: raw?.numeroProcedimientoContratacion ?? null,
+      datosGenerales: {
+        dependenciaOEntidad: raw?.dependenciaOEntidad ?? null,
+        descripcionDetallada: raw?.descripcionDetallada ?? null,
+        nombreProcedimiento: raw?.nombreProcedimiento ?? null,
+      },
+      cronograma: {
+        presentacionAperturaProposiciones: raw?.presentacionAperturaProposiciones ?? null,
+        limiteAclaracionesComprasmx: raw?.limiteAclaracionesComprasmx ?? null,
+        aplicaJuntaAclaraciones: raw?.aplicaJuntaAclaraciones ?? null,
+        fechaHoraActoFallo: raw?.fechaHoraActoFallo ?? null,
+      },
+      entidadFederativaContratacion: raw?.entidadFederativaContratacion ?? null,
+      anexos,
+    };
+  } catch (e) {
+    return {
+      ...detalleProcedimientoVacio(),
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+
 export type FetchComprasmxOptions = {
   /**
    * `true`/`false`: forzar modo con o sin ventana.
-   * `undefined`: modo automático (ver `resolveHeaded` abajo).
+   * `undefined`: headless por defecto; `PLAYWRIGHT_HEADED=1` para ventana visible.
    */
   headed?: boolean;
   /** Fecha publicación «desde», formato `DD/MM/AAAA`. Si no viene, se usa hoy (CDMX). */
@@ -547,6 +988,11 @@ export type FetchComprasmxOptions = {
    * Si se omite o queda vacío, se usa `ENTIDADES_FEDERATIVAS_FILTRO`.
    */
   entidadesFederativas?: string[];
+  /**
+   * Si se envía, la respuesta solo incluye filas cuyo `nombre` contiene alguna palabra (sin distinguir mayúsculas).
+   * Por cada una (hasta el límite) se hace clic en el expediente en el listado, se lee el detalle en la pestaña nueva o en la misma ventana, y se vuelve al listado.
+   */
+  palabrasClave?: string[];
 };
 
 /** Reutiliza Chromium entre peticiones (mismo modo headed/headless). Ahorra varios segundos por request. */
@@ -574,18 +1020,13 @@ async function obtainSharedBrowser(headed: boolean, width: number, height: numbe
 }
 
 /**
- * Arranca Chromium al levantar el API para que la primera petición no pague todo el cold start.
- * - `COMPRASMX_WARM_BROWSER=0`: nunca.
- * - `COMPRASMX_WARM_BROWSER=1`: siempre (incluye headed: abre ventana al iniciar el servidor).
- * - sin definir: solo en headless (p. ej. producción con `PLAYWRIGHT_HEADLESS` o `NODE_ENV=production`).
+ * Precalienta Chromium solo si `COMPRASMX_WARM_BROWSER=1` (no arranca navegador al levantar el API por defecto).
  */
 export async function warmComprasmxBrowser(): Promise<void> {
+  if (process.env.COMPRASMX_WARM_BROWSER !== "1") return;
   if (process.env.COMPRASMX_REUSE_BROWSER === "0") return;
-  const raw = process.env.COMPRASMX_WARM_BROWSER?.trim();
-  if (raw === "0") return;
-  const headed = resolveHeaded(undefined);
-  if (raw !== "1" && headed) return;
   ensureBrowserShutdownHooks();
+  const headed = resolveHeaded(undefined);
   const { width, height } = resolveViewportSize();
   await obtainSharedBrowser(headed, width, height);
 }
@@ -612,14 +1053,13 @@ function ensureBrowserShutdownHooks(): void {
   process.once("SIGTERM", closeAll);
 }
 
-/** Por defecto en desarrollo: navegador visible; en producción: headless. */
+/** Por defecto: headless (sin ventana). `PLAYWRIGHT_HEADED=1` o `?headed=1` para ver el navegador. */
 function resolveHeaded(explicit?: boolean): boolean {
   if (explicit === false) return false;
   if (explicit === true) return true;
-  if (process.env.PLAYWRIGHT_HEADLESS === "1") return false;
   if (process.env.PLAYWRIGHT_HEADED === "1") return true;
-  if (process.env.NODE_ENV === "production") return false;
-  return true;
+  if (process.env.PLAYWRIGHT_HEADLESS === "1") return false;
+  return false;
 }
 
 export async function fetchComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<ComprasmxSnapshot> {
@@ -668,11 +1108,11 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
     page.setDefaultNavigationTimeout(navTimeoutMs);
 
     await page.goto(SOURCE_URL, { waitUntil: "domcontentloaded" });
-    await delay(1500);
+    await delay(fastMode() ? 800 : 1500);
 
     await abrirPanelFiltros(page);
 
-    await delay(800);
+    await delay(fastMode() ? 350 : 800);
 
     await scrollPanelFiltrosAlInicio(page);
 
@@ -688,7 +1128,7 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
 
     const multiselect = page.locator('p-multiselect[name="entidades"]');
     await multiselect.locator(".p-multiselect").click();
-    await delay(800);
+    await delay(fastMode() ? 450 : 800);
 
     for (const nombre of entidades) {
       const rx = new RegExp(`^${escapeRegex(nombre)}$`, "i");
@@ -706,21 +1146,78 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
 
     const filas = await extraerFilasConReintentos(page, totalPie, sinResultados);
 
+    const baseFiltros = {
+      fechaPublicacionDesde: fechaDesde,
+      fechaPublicacionHasta: fechaHasta,
+      entidadesFederativas: entidades,
+      pestanaResultados: pestana,
+    };
+
+    const palabrasRespuesta = (opts?.palabrasClave ?? []).map((k) => k.trim()).filter(Boolean);
+    const kws = palabrasRespuesta.map((k) => k.toLowerCase());
+
+    if (kws.length === 0) {
+      return {
+        source: SOURCE_URL,
+        fetchedAt: new Date().toISOString(),
+        filtros: baseFiltros,
+        valoresFormularioDetectados: {
+          fechaDesdePublicacion: domFechas.desde,
+          fechaHastaPublicacion: domFechas.hasta,
+        },
+        filas,
+        totalFilas: filas.length,
+        totalEnPieDePortal: sinResultados ? 0 : totalPie,
+      };
+    }
+
+    const lim = maxProcedimientoDetalle();
+    const coincidencias = filas.filter((f) => kws.some((kw) => f.nombre.toLowerCase().includes(kw)));
+    const omitidos = Math.max(0, coincidencias.length - lim);
+    const procesar = coincidencias.slice(0, lim);
+
+    const detMs = Number(process.env.COMPRASMX_PROCEDIMIENTO_TIMEOUT_MS) || 60_000;
+    const popupTimeoutMs = Number(process.env.COMPRASMX_PROCEDIMIENTO_POPUP_TIMEOUT_MS) || 15_000;
+
+    const enriched: ComprasmxFila[] = [];
+    for (const row of procesar) {
+      try {
+        const { detailPage, mode } = await abrirDetalleProcedimientoDesdeListado(
+          page,
+          row.numeroIdentificacion,
+          popupTimeoutMs,
+          detMs,
+        );
+        const det = await extraerDetalleProcedimientoDesdePage(detailPage);
+        enriched.push({ ...row, detalleProcedimiento: det });
+        await cerrarDetalleYLiberarListado(page, detailPage, mode);
+      } catch (e) {
+        enriched.push({
+          ...row,
+          detalleProcedimiento: {
+            ...detalleProcedimientoVacio(),
+            error: e instanceof Error ? e.message : String(e),
+          },
+        });
+      }
+    }
+
     return {
       source: SOURCE_URL,
       fetchedAt: new Date().toISOString(),
       filtros: {
-        fechaPublicacionDesde: fechaDesde,
-        fechaPublicacionHasta: fechaHasta,
-        entidadesFederativas: entidades,
-        pestanaResultados: pestana,
+        ...baseFiltros,
+        palabrasClave: palabrasRespuesta,
+        detalleProcedimientoMax: lim,
+        coincidenciasListadoKeyword: coincidencias.length,
+        detallesOmitidosPorLimite: omitidos,
       },
       valoresFormularioDetectados: {
         fechaDesdePublicacion: domFechas.desde,
         fechaHastaPublicacion: domFechas.hasta,
       },
-      filas,
-      totalFilas: filas.length,
+      filas: enriched,
+      totalFilas: enriched.length,
       totalEnPieDePortal: sinResultados ? 0 : totalPie,
     };
   } finally {

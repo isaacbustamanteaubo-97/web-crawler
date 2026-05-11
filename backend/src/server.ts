@@ -8,7 +8,9 @@ const app = buildApp();
 
 app.listen(port, host, () => {
   console.log(`Listening on http://${host}:${port}`);
-  void warmComprasmxBrowser().catch((err) => {
-    console.warn("[comprasmx] No se pudo precalentar Chromium; el primer snapshot lanzará el navegador.", err);
-  });
+  if (process.env.COMPRASMX_WARM_BROWSER === "1") {
+    void warmComprasmxBrowser().catch((err) => {
+      console.warn("[comprasmx] No se pudo precalentar Chromium.", err);
+    });
+  }
 });
