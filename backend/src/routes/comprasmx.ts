@@ -91,6 +91,7 @@ comprasmxRouter.post("/snapshot", async (req: Request, res: Response, next: Next
     }
 
     const body = requestBodyRecord(req);
+
     const entidadesInBody = Object.prototype.hasOwnProperty.call(body, "entidadesFederativas");
     const entidadesParsed = parseEntidadesFederativasCliente(
       entidadesInBody ? body["entidadesFederativas"] : undefined,
@@ -100,11 +101,41 @@ comprasmxRouter.post("/snapshot", async (req: Request, res: Response, next: Next
       return;
     }
 
+    const palabrasClaveRaw = body["palabrasClave"];
+    let palabrasClave: string[] | undefined;
+    if (palabrasClaveRaw !== undefined) {
+      if (!Array.isArray(palabrasClaveRaw) || palabrasClaveRaw.some((p) => typeof p !== "string")) {
+        res.status(400).json({ error: "palabrasClave debe ser un arreglo de cadenas, ej. [\"mantenimiento\", \"limpieza\"]" });
+        return;
+      }
+      palabrasClave = (palabrasClaveRaw as string[]).map((p) => p.trim()).filter(Boolean);
+      if (palabrasClave.length === 0) {
+        res.status(400).json({ error: "Si envías palabrasClave, incluye al menos una cadena no vacía." });
+        return;
+      }
+    }
+
     const data = await fetchComprasmxSnapshot({
       ...(headedExplicit !== undefined ? { headed: headedExplicit } : {}),
       ...(fechas ? { fechaPublicacionDesde: fechas.desde, fechaPublicacionHasta: fechas.hasta } : {}),
       ...(entidadesParsed.values ? { entidadesFederativas: entidadesParsed.values } : {}),
     });
+
+    if (palabrasClave && palabrasClave.length > 0) {
+      const kws = palabrasClave.map((k) => k.toLowerCase());
+      const filasFiltradas = data.filas.filter((fila) => {
+        const nombre = fila.nombre.toLowerCase();
+        return kws.some((kw) => nombre.includes(kw));
+      });
+      res.json({
+        ...data,
+        filtros: { ...data.filtros, palabrasClave },
+        filas: filasFiltradas,
+        totalFilas: filasFiltradas.length,
+      });
+      return;
+    }
+
     res.json(data);
   } catch (err) {
     next(err);
