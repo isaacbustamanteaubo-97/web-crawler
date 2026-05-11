@@ -22,6 +22,57 @@ export const ENTIDADES_FEDERATIVAS_FILTRO = [
   "YUCATÁN",
 ] as const;
 
+function normEntidadNombre(s: string): string {
+  return s
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+const ENTIDAD_CANONICA_POR_NORMALIZADO: ReadonlyMap<string, string> = new Map(
+  ENTIDADES_FEDERATIVAS_FILTRO.map((e) => [normEntidadNombre(e), e]),
+);
+
+/**
+ * Interpreta `entidadesFederativas` del cliente.
+ * Sin campo / `null` → el caller usa el arreglo por defecto del servicio.
+ * Arreglo vacío o valores inválidos → `error`.
+ */
+export function parseEntidadesFederativasCliente(raw: unknown): { values?: string[]; error?: string } {
+  if (raw === undefined || raw === null) return {};
+  if (!Array.isArray(raw)) {
+    return { error: "entidadesFederativas debe ser un arreglo de cadenas (nombres de estado)" };
+  }
+  if (raw.length === 0) {
+    return {
+      error:
+        "Si envías entidadesFederativas, incluye al menos un estado; omite la propiedad para usar el filtro predeterminado del servicio.",
+    };
+  }
+  const out: string[] = [];
+  const invalid: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string" || !item.trim()) {
+      invalid.push(typeof item === "string" ? "(vacío)" : String(item));
+      continue;
+    }
+    const canon = ENTIDAD_CANONICA_POR_NORMALIZADO.get(normEntidadNombre(item));
+    if (canon) {
+      if (!out.includes(canon)) out.push(canon);
+    } else {
+      invalid.push(item.trim());
+    }
+  }
+  if (invalid.length) {
+    return {
+      error: `Entidades no reconocidas: ${invalid.join(", ")}. Valores admitidos: ${ENTIDADES_FEDERATIVAS_FILTRO.join(", ")}.`,
+    };
+  }
+  return { values: out };
+}
+
 export type ComprasmxFila = {
   numeroIdentificacion: string;
   nombre: string;
@@ -448,10 +499,24 @@ export type FetchComprasmxOptions = {
   fechaPublicacionDesde?: string;
   /** Fecha publicación «hasta». Si no viene, coincide con `fechaPublicacionDesde`. */
   fechaPublicacionHasta?: string;
+  /**
+   * Estados a marcar en el multiselect (nombres canónicos como en el portal).
+   * Si se omite o queda vacío, se usa `ENTIDADES_FEDERATIVAS_FILTRO`.
+   */
+  entidadesFederativas?: string[];
 };
 
 /** Reutiliza Chromium entre peticiones (mismo modo headed/headless). Ahorra varios segundos por request. */
 const sharedBrowsers = new Map<string, Browser>();
+
+function chromiumLaunchArgs(width: number, height: number): string[] {
+  return [
+    `--window-size=${width},${height}`,
+    "--disable-extensions",
+    "--no-first-run",
+    "--disable-background-networking",
+  ];
+}
 
 async function obtainSharedBrowser(headed: boolean, width: number, height: number): Promise<Browser> {
   const key = headed ? "headed" : "headless";
@@ -459,10 +524,27 @@ async function obtainSharedBrowser(headed: boolean, width: number, height: numbe
   if (cur?.isConnected()) return cur;
   const b = await chromium.launch({
     headless: !headed,
-    args: [`--window-size=${width},${height}`, "--disable-extensions"],
+    args: chromiumLaunchArgs(width, height),
   });
   sharedBrowsers.set(key, b);
   return b;
+}
+
+/**
+ * Arranca Chromium al levantar el API para que la primera petición no pague todo el cold start.
+ * - `COMPRASMX_WARM_BROWSER=0`: nunca.
+ * - `COMPRASMX_WARM_BROWSER=1`: siempre (incluye headed: abre ventana al iniciar el servidor).
+ * - sin definir: solo en headless (p. ej. producción con `PLAYWRIGHT_HEADLESS` o `NODE_ENV=production`).
+ */
+export async function warmComprasmxBrowser(): Promise<void> {
+  if (process.env.COMPRASMX_REUSE_BROWSER === "0") return;
+  const raw = process.env.COMPRASMX_WARM_BROWSER?.trim();
+  if (raw === "0") return;
+  const headed = resolveHeaded(undefined);
+  if (raw !== "1" && headed) return;
+  ensureBrowserShutdownHooks();
+  const { width, height } = resolveViewportSize();
+  await obtainSharedBrowser(headed, width, height);
 }
 
 async function instalarBloqueoRecursosLigeros(page: Page): Promise<void> {
@@ -506,7 +588,10 @@ export async function fetchComprasmxSnapshot(opts?: FetchComprasmxOptions): Prom
 async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<ComprasmxSnapshot> {
   const fechaDesde = opts?.fechaPublicacionDesde ?? fechaHoyDdMmYyyy();
   const fechaHasta = opts?.fechaPublicacionHasta ?? fechaDesde;
-  const entidades = [...ENTIDADES_FEDERATIVAS_FILTRO];
+  const entidades =
+    opts?.entidadesFederativas && opts.entidadesFederativas.length > 0
+      ? [...opts.entidadesFederativas]
+      : [...ENTIDADES_FEDERATIVAS_FILTRO];
 
   const headed = resolveHeaded(opts?.headed);
   const reuseBrowser = process.env.COMPRASMX_REUSE_BROWSER !== "0";
@@ -522,7 +607,7 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
     } else {
       disposableBrowser = await chromium.launch({
         headless: !headed,
-        args: [`--window-size=${width},${height}`, "--disable-extensions"],
+        args: chromiumLaunchArgs(width, height),
       });
       browser = disposableBrowser;
     }
