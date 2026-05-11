@@ -310,10 +310,11 @@ async function leerTotalPiePortal(page: Page): Promise<number | null> {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
-/** Espera a que el portal muestre "Total: N" o el mensaje de sin resultados (evita leer la tabla en blanco). */
+/** Espera a que el portal muestre "Total: N" para la búsqueda actual. */
 async function esperarRespuestaBusqueda(
   page: Page,
   navTimeoutMs: number,
+  totalPieAntes?: number | null,
 ): Promise<{ totalPie: number | null; sinResultados: boolean }> {
   const vacio = page.getByText(/No se encontraron resultados\s+para tu búsqueda|No se encontraron resultados/i);
   const start = Date.now();
@@ -322,15 +323,36 @@ async function esperarRespuestaBusqueda(
     if ((await loading.count()) > 0) {
       await loading.first().waitFor({ state: "hidden", timeout: 8000 }).catch(() => {});
     }
+
     if (await vacio.isVisible().catch(() => false)) {
       await delay(400);
       return { totalPie: 0, sinResultados: true };
     }
+
     const totalPie = await leerTotalPiePortal(page);
     if (totalPie !== null) {
-      await delay(700);
-      return { totalPie, sinResultados: false };
+      // Si el total no cambió, normalmente leímos el estado anterior mientras la SPA terminaba de refrescar.
+      if (
+        totalPieAntes !== undefined &&
+        totalPieAntes !== null &&
+        Number.isFinite(totalPieAntes) &&
+        totalPie === totalPieAntes
+      ) {
+        await delay(450);
+        continue;
+      }
+
+      // Estabilidad: intentamos leer "Total" dos veces para evitar valores parciales.
+      await delay(500);
+      const total2 = await leerTotalPiePortal(page);
+      if (total2 !== null && total2 === totalPie) {
+        return { totalPie, sinResultados: false };
+      }
+
+      await delay(300);
+      continue;
     }
+
     await delay(320);
   }
   return { totalPie: await leerTotalPiePortal(page), sinResultados: false };
@@ -348,7 +370,7 @@ async function extraerFilasConReintentos(
   for (let r = 0; r < maxRounds; r++) {
     filas = await extraerFilasNumeroyNombre(page);
     if (totalEsperado !== null && totalEsperado > 0) {
-      if (filas.length >= totalEsperado) break;
+      if (filas.length >= totalEsperado) return filas.slice(0, totalEsperado);
       if (filas.length > 0 && filas.length < totalEsperado) {
         await delay(900);
         continue;
@@ -356,6 +378,9 @@ async function extraerFilasConReintentos(
     }
     if (filas.length > 0) break;
     await delay(900);
+  }
+  if (totalEsperado !== null && totalEsperado > 0 && filas.length > totalEsperado) {
+    return filas.slice(0, totalEsperado);
   }
   return filas;
 }
@@ -451,11 +476,29 @@ const EXTRACT_FILAS_UI_SCRIPT = `(() => {
   function pickTable() {
     var candidates = Array.from(document.querySelectorAll("p-table table, .p-datatable table, .layout-main table, main table"));
     var best = null;
-    var bestN = 0;
+    var bestN = -1;
     for (var i = 0; i < candidates.length; i++) {
-      var tb = candidates[i].querySelector("tbody");
+      var table = candidates[i];
+      var rect = table.getBoundingClientRect ? table.getBoundingClientRect() : null;
+      if (rect && rect.width === 0 && rect.height === 0) continue;
+
+      var headerCells = Array.from(table.querySelectorAll("thead th"));
+      var headers = headerCells.map(function (th) { return norm(th.textContent || ""); });
+      var idxNum = headers.findIndex(function (h) { return /n[uú]mero\\s+de\\s+identificaci[oó]n/i.test(h); });
+      if (idxNum < 0) idxNum = headers.findIndex(function (h) { return /^expediente$/i.test(h); });
+      if (idxNum < 0) idxNum = headers.findIndex(function (h) { return /expediente/i.test(h) && !/c[oó]digo/i.test(h); });
+
+      var idxNombre = headerCells.findIndex(function (th) {
+        return (th.getAttribute("psortablecolumn") || "") === "nombre_procedimiento";
+      });
+      if (idxNombre < 0) idxNombre = headers.findIndex(function (h) { return /^nombre$/i.test(h) && !/identificaci[oó]/i.test(h); });
+      if (idxNombre < 0) idxNombre = headers.findIndex(function (h) { return /^descripci[oó]n$/i.test(h); });
+
+      if (idxNum < 0 || idxNombre < 0) continue;
+
+      var tb = table.querySelector("tbody");
       var n = tb ? tb.querySelectorAll("tr").length : 0;
-      if (n > bestN) { best = candidates[i]; bestN = n; }
+      if (n > bestN) { best = table; bestN = n; }
     }
     return best || document.querySelector("table");
   }
@@ -655,9 +698,11 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
 
     await cerrarOverlayMultiselect(page, multiselect);
 
+    // Antes del click guardamos el total para poder detectar si la SPA todavía está mostrando el estado anterior.
+    const totalPieAntesBusqueda = await leerTotalPiePortal(page);
     await clickBuscar(page, navTimeoutMs);
 
-    const { totalPie, sinResultados } = await esperarRespuestaBusqueda(page, navTimeoutMs);
+    const { totalPie, sinResultados } = await esperarRespuestaBusqueda(page, navTimeoutMs, totalPieAntesBusqueda);
 
     const filas = await extraerFilasConReintentos(page, totalPie, sinResultados);
 
