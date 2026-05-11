@@ -866,6 +866,57 @@ const EXTRACT_PROCEDIMIENTO_UI_SCRIPT = `(() => {
     return pickLine(needles);
   }
 
+  /** Valor del segundo <label> (sin font-bold) bajo el encabezado, como en Cronograma de eventos. */
+  function valorBajoEncabezadoBoldLabels(r, needles) {
+    if (!r) return null;
+    var nneedles = needles.map(nfd);
+    var bolds = r.querySelectorAll("label.font-bold");
+    for (var i = 0; i < bolds.length; i++) {
+      var lb = bolds[i];
+      var ht = nfd(norm(lb.textContent || ""));
+      var hit = false;
+      for (var j = 0; j < nneedles.length; j++) {
+        if (ht.indexOf(nneedles[j]) >= 0) {
+          hit = true;
+          break;
+        }
+      }
+      if (!hit) continue;
+      var el = lb.nextElementSibling;
+      while (el) {
+        if (el.tagName === "BR") {
+          el = el.nextElementSibling;
+          continue;
+        }
+        if (el.tagName === "LABEL") {
+          var cl = el.getAttribute("class") || "";
+          if (cl.indexOf("font-bold") >= 0) break;
+          var v = norm(el.textContent || "");
+          return v || null;
+        }
+        el = el.nextElementSibling;
+      }
+    }
+    return null;
+  }
+
+  function saneaJuntaAclaraciones(v) {
+    if (!v) return null;
+    var t = norm(v);
+    if (t.length > 6) return null;
+    if (!/^(SI|NO|SÍ)$/i.test(t)) return null;
+    return /^sí$/i.test(t) ? "SÍ" : t.toUpperCase();
+  }
+
+  function saneaFechaHoraActoFallo(v) {
+    if (!v) return null;
+    var t = norm(v);
+    if (t.length > 28) return null;
+    if (/datos\\s+espec|participaci[oó]n\\s+de\\s+testigo/i.test(t)) return null;
+    if (!/\\d{1,2}\\/\\d{1,2}\\/\\d{4}/.test(t)) return null;
+    return t;
+  }
+
   var anexos = [];
   var seen = {};
   function pushAnexo(tit, href) {
@@ -932,8 +983,12 @@ const EXTRACT_PROCEDIMIENTO_UI_SCRIPT = `(() => {
       "aclaraciones a través de compras mx",
       "aclaraciones a traves de compras mx",
     ]),
-    aplicaJuntaAclaraciones: pick(pairs, ["aplica junta de aclaraciones", "junta de aclaraciones"]),
-    fechaHoraActoFallo: pick(pairs, ["fecha y hora del acto del fallo", "acto del fallo"]),
+    aplicaJuntaAclaraciones: saneaJuntaAclaraciones(
+      valorBajoEncabezadoBoldLabels(root, ["aplica junta de aclaraciones"]),
+    ),
+    fechaHoraActoFallo: saneaFechaHoraActoFallo(
+      valorBajoEncabezadoBoldLabels(root, ["fecha y hora del acto del fallo"]),
+    ),
     entidadFederativaContratacion: pick(pairs, [
       "entidad federativa donde se llevará a cabo la contratación",
       "entidad federativa donde se llevara a cabo la contratacion",
