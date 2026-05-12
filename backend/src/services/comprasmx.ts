@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Download, type Locator, type Page } from "playwright";
 
 const SOURCE_URL =
   "https://comprasmx.buengobierno.gob.mx/sitiopublico/#/";
@@ -734,6 +734,18 @@ function baseDirAnexosComprasmx(): string {
 }
 
 /**
+ * Icono de descarga en ANEXOS (PrimeIcons + PrimeNG): clase `pi pi-download`, tooltip «Descargar archivo».
+ * No suele ir dentro de `<button>`; el `(click)` va en el `<i>`.
+ */
+const SEL_ICONO_DESCARGA_ANEXO_STRICT = 'tbody i.pi.pi-download[ptooltip="Descargar archivo"]';
+const SEL_ICONO_DESCARGA_ANEXO_FALLBACK =
+  "tbody i.pi.pi-download, tbody i.pi-download.p-element, tbody i.p-element.pi-download, tbody i.pi-download";
+
+function locatorIconosDescargaAnexos(widget: Locator): Locator {
+  return widget.locator(`${SEL_ICONO_DESCARGA_ANEXO_STRICT}, ${SEL_ICONO_DESCARGA_ANEXO_FALLBACK}`);
+}
+
+/**
  * PrimeNG a menudo pone `<thead>` en una tabla y `<tbody>` en otra (scrollable / frozen).
  * Filtrar un solo `<table>` falla siempre → hay que anclar al widget `p-table` / `.p-datatable`.
  */
@@ -748,11 +760,11 @@ async function localizarWidgetTablaAnexos(page: Page): Promise<Locator | null> {
     }).filter({
       has: panel.locator("th").filter({ hasText: /Acci[oó]n(es)?/i }),
     }).filter({
-      has: panel.locator("tbody i.pi-download, tbody .pi-download"),
+      has: panel.locator(SEL_ICONO_DESCARGA_ANEXO_FALLBACK),
     });
     if ((await scoped.count()) > 0) return scoped.first();
     const scopedLoose = panel.locator("p-table, .p-datatable").filter({
-      has: panel.locator("tbody i.pi-download, tbody .pi-download"),
+      has: panel.locator(SEL_ICONO_DESCARGA_ANEXO_FALLBACK),
     });
     if ((await scopedLoose.count()) > 0) return scopedLoose.first();
   }
@@ -762,12 +774,12 @@ async function localizarWidgetTablaAnexos(page: Page): Promise<Locator | null> {
   }).filter({
     has: page.locator("th").filter({ hasText: /Acci[oó]n(es)?/i }),
   }).filter({
-    has: page.locator("tbody i.pi-download, tbody .pi-download"),
+    has: page.locator(SEL_ICONO_DESCARGA_ANEXO_FALLBACK),
   });
   if ((await widgets.count()) > 0) return widgets.first();
 
   const loose = page.locator("p-table, .p-datatable").filter({
-    has: page.locator("tbody i.pi-download, tbody .pi-download"),
+    has: page.locator(SEL_ICONO_DESCARGA_ANEXO_FALLBACK),
   });
   if ((await loose.count()) > 0) return loose.first();
   return null;
@@ -796,59 +808,71 @@ async function prepararSeccionAnexosVisible(page: Page): Promise<void> {
   if (await head.count()) await head.scrollIntoViewIfNeeded().catch(() => {});
   await delay(fastMode() ? 70 : 140);
   await page
-    .locator("tbody i.pi-download, i.pi-download")
+    .locator(`${SEL_ICONO_DESCARGA_ANEXO_STRICT}, ${SEL_ICONO_DESCARGA_ANEXO_FALLBACK}, i.pi.pi-download`)
     .first()
     .waitFor({ state: "visible", timeout: 35_000 })
     .catch(() => {});
 }
 
 /**
- * El portal no expone `href` en ANEXOS: hay que pulsar `i.pi-download` y capturar el evento `download`
- * (o una pestaña nueva con PDF). `COMPRASMX_SKIP_ANEXO_DOWNLOAD=1` lo desactiva.
- * `COMPRASMX_ANEXOS_DIR`: carpeta base (por defecto `<cwd>/comprasmx-anexos`).
+ * ANEXOS: solo se pulsa el control de descarga; Playwright captura el evento `download` del navegador
+ * (cualquier pestaña del mismo contexto) y guarda con `saveAs` en la carpeta del expediente.
+ * `COMPRASMX_SKIP_ANEXO_DOWNLOAD=1` lo desactiva. `COMPRASMX_ANEXOS_DIR`: carpeta base.
  */
+async function esperarPrimerDownloadEnContexto(ctx: BrowserContext, timeoutMs: number): Promise<Download | null> {
+  return new Promise((resolve) => {
+    let listo = false;
+    const fin = (d: Download | null) => {
+      if (listo) return;
+      listo = true;
+      clearTimeout(timer);
+      ctx.off("page", alNueva);
+      for (const p of ctx.pages()) {
+        p.off("download", alDownload);
+      }
+      resolve(d);
+    };
+    const timer = setTimeout(() => fin(null), timeoutMs);
+    const alDownload = (d: Download) => fin(d);
+    const alNueva = (p: Page) => {
+      p.on("download", alDownload);
+    };
+    ctx.on("page", alNueva);
+    for (const p of ctx.pages()) {
+      p.on("download", alDownload);
+    }
+  });
+}
+
 async function guardarArchivoTrasClicDescarga(
   page: Page,
-  icon: Locator,
+  clickTarget: Locator,
   sessionDir: string,
   filePrefix: string,
   perFileMs: number,
 ): Promise<string | null> {
   const ctx = page.context();
-  const dPromise = page.waitForEvent("download", { timeout: perFileMs });
-  const pPromise = ctx.waitForEvent("page", { timeout: perFileMs });
-  await icon.scrollIntoViewIfNeeded().catch(() => {});
-  await icon.click({ timeout: 15_000 });
-  const settled = await Promise.allSettled([dPromise, pPromise]);
-  const dRes = settled[0];
-  const pRes = settled[1];
-  if (dRes.status === "fulfilled") {
-    const download = dRes.value;
-    const suggested = download.suggestedFilename() || `${filePrefix}.bin`;
-    const dest = path.join(sessionDir, `${filePrefix}_${suggested.replace(/[/\\]/g, "_")}`);
-    await download.saveAs(dest);
-    return dest;
+  const desdeCtx = esperarPrimerDownloadEnContexto(ctx, perFileMs);
+  const popupMs = Math.min(4_000, Math.max(1_200, Math.floor(perFileMs * 0.08)));
+  const desdePopup = ctx
+    .waitForEvent("page", { timeout: popupMs })
+    .then((p) => p.waitForEvent("download", { timeout: Math.max(8_000, perFileMs - popupMs) }))
+    .catch(() => new Promise<Download>(() => {}));
+  const espera = Promise.race([desdeCtx, desdePopup]);
+
+  await clickTarget.scrollIntoViewIfNeeded().catch(() => {});
+  try {
+    await clickTarget.click({ timeout: 15_000, force: true });
+  } catch {
+    await clickTarget.evaluate((el: HTMLElement) => el.click());
   }
-  if (pRes.status === "fulfilled") {
-    const np = pRes.value;
-    try {
-      await np.waitForLoadState("domcontentloaded", { timeout: 28_000 }).catch(() => {});
-      const url = np.url();
-      if (url.startsWith("http") && /\.pdf(\?|#|$)/i.test(url)) {
-        const resp = await page.request.get(url);
-        if (resp.ok()) {
-          const dest = path.join(sessionDir, `${filePrefix}_documento.pdf`);
-          await fs.writeFile(dest, await resp.body());
-          await np.close().catch(() => {});
-          return dest;
-        }
-      }
-      await np.close().catch(() => {});
-    } catch {
-      await np.close().catch(() => {});
-    }
-  }
-  return null;
+
+  const download = await espera;
+  if (!download) return null;
+  const suggested = download.suggestedFilename() || `${filePrefix}.bin`;
+  const dest = path.join(sessionDir, `${filePrefix}_${suggested.replace(/[/\\]/g, "_")}`);
+  await download.saveAs(dest);
+  return dest;
 }
 
 async function descargarAnexosPorIconosDescargar(page: Page, expedienteListadoId: string): Promise<ComprasmxAnexo[]> {
@@ -858,26 +882,35 @@ async function descargarAnexosPorIconosDescargar(page: Page, expedienteListadoId
   const timeoutMs = Number(process.env.COMPRASMX_ANEXO_DOWNLOAD_TIMEOUT_MS);
   const perFileMs = Number.isFinite(timeoutMs) && timeoutMs > 5_000 ? timeoutMs : 75_000;
 
-  const widget = await localizarWidgetTablaAnexos(page);
+  let widget = await localizarWidgetTablaAnexos(page);
+  if (!widget) {
+    await page
+      .locator(`${SEL_ICONO_DESCARGA_ANEXO_STRICT}, ${SEL_ICONO_DESCARGA_ANEXO_FALLBACK}, i.pi.pi-download`)
+      .first()
+      .waitFor({ state: "attached", timeout: 15_000 })
+      .catch(() => {});
+    widget = await localizarWidgetTablaAnexos(page);
+  }
   if (!widget) return [];
   await revelarScrollHorizontalTablaAnexos(widget);
 
-  const rows = widget.locator("tbody tr").filter({ has: widget.locator("i.pi-download") });
-  const rowCount = await rows.count();
-  const iconSel = "i.pi-download.p-element, i.p-element.pi-download, i.pi-download";
-  const out: ComprasmxAnexo[] = [];
+  const iconCount = await locatorIconosDescargaAnexos(widget).count();
+  if (iconCount === 0) return [];
 
+  const out: ComprasmxAnexo[] = [];
   const baseDir = baseDirAnexosComprasmx();
   const sessionDir = path.join(baseDir, expedienteParaNombreCarpeta(expedienteListadoId));
   await fs.mkdir(sessionDir, { recursive: true });
 
   let saved = 0;
-  for (let i = 0; i < rowCount && saved < max; i++) {
-    const row = rows.nth(i);
+  for (let i = 0; i < iconCount && saved < max; i++) {
+    const icon = locatorIconosDescargaAnexos(widget).nth(i);
+    const row = icon.locator("xpath=./ancestor::tr[1]");
     await row.scrollIntoViewIfNeeded().catch(() => {});
-    const icon = row.locator(iconSel).first();
     await icon.waitFor({ state: "visible", timeout: 12_000 }).catch(() => {});
     if ((await icon.count()) === 0) continue;
+
+    const clickTarget = icon;
 
     const cells = row.locator("td");
     const cellText = async (idx: number) =>
@@ -891,11 +924,10 @@ async function descargarAnexosPorIconosDescargar(page: Page, expedienteListadoId
       (num ? `Anexo ${num}` : `Anexo ${saved + 1}`);
 
     const prefix = String(saved + 1).padStart(2, "0");
-    const dest = await guardarArchivoTrasClicDescarga(page, icon, sessionDir, prefix, perFileMs);
+    const dest = await guardarArchivoTrasClicDescarga(page, clickTarget, sessionDir, prefix, perFileMs);
     if (dest) {
       out.push({ titulo, archivoLocal: dest });
       saved += 1;
-      await delay(fastMode() ? 35 : 70);
     }
   }
 
