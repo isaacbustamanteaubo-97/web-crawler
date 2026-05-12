@@ -153,14 +153,16 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** `COMPRASMX_FAST=0` desactiva acortar pausas (más estable, más lento). */
+/** `COMPRASMX_FAST=0` usa las pausas literales (más estable, más lento). */
 function fastMode(): boolean {
   return process.env.COMPRASMX_FAST !== "0";
 }
 
+/** En modo rápido (default) escala ~10%: prioriza velocidad; use `COMPRASMX_FAST=0` si falla en red lenta. */
 function delay(ms: number): Promise<void> {
-  const ms2 = fastMode() ? Math.max(25, Math.floor(ms * 0.45)) : ms;
-  return sleep(ms2);
+  if (!fastMode()) return sleep(ms);
+  const scaled = Math.floor(ms * 0.1);
+  return sleep(scaled > 0 ? scaled : ms > 0 ? 1 : 0);
 }
 
 function fechaHoyDdMmYyyy(): string {
@@ -216,7 +218,7 @@ async function configurarVistaListado(page: Page, pestana: "vigentes" | "seguimi
     if (await cb.isVisible().catch(() => false)) {
       if (!(await cb.isChecked().catch(() => false))) {
         await cb.check({ force: true });
-        await delay(600);
+        await delay(120);
       }
     }
     return;
@@ -224,12 +226,12 @@ async function configurarVistaListado(page: Page, pestana: "vigentes" | "seguimi
   if (pestana === "seguimiento") {
     const tab = page.getByRole("tab", { name: /Anuncios en seguimiento/i }).first();
     if (await tab.isVisible().catch(() => false)) await tab.click({ timeout: 15_000 });
-    await delay(900);
+    await delay(160);
     return;
   }
   const tab = page.getByRole("tab", { name: /Anuncios concluidos/i }).first();
   if (await tab.isVisible().catch(() => false)) await tab.click({ timeout: 15_000 });
-  await delay(900);
+  await delay(160);
 }
 
 function soloDigitosFecha(s: string): string {
@@ -249,6 +251,20 @@ async function establecerValorInputAngular(page: Page, name: string, val: string
   );
 }
 
+/** Si PrimeNG acepta el valor vía DOM, evita calendario y tecleo lento. */
+async function intentarEstablecerFechasPublicacionEvaluate(
+  page: Page,
+  fechaDesde: string,
+  fechaHasta: string,
+): Promise<boolean> {
+  await establecerValorInputAngular(page, "fechaDesdeP", fechaDesde);
+  await establecerValorInputAngular(page, "fechaHastaP", fechaHasta);
+  await delay(fastMode() ? 12 : 35);
+  const d = (await page.locator('input[name="fechaDesdeP"]').inputValue().catch(() => "")).trim();
+  const h = (await page.locator('input[name="fechaHastaP"]').inputValue().catch(() => "")).trim();
+  return fechasValorEquivalentes(d, fechaDesde) && fechasValorEquivalentes(h, fechaHasta);
+}
+
 /** PrimeNG/ngModel suele ignorar sólo .fill(): teclado + disparo DOM + último recurso clic en calendario. */
 async function establecerFechaPublicacionCampo(page: Page, name: string, fecha: string): Promise<void> {
   const { day, month, year } = (() => {
@@ -261,22 +277,22 @@ async function establecerFechaPublicacionCampo(page: Page, name: string, fecha: 
   await loc.waitFor({ state: "visible" });
   await loc.click();
   await loc.press("Control+a");
-  await loc.pressSequentially(fecha, { delay: fastMode() ? 10 : 25 });
+  await loc.pressSequentially(fecha, { delay: fastMode() ? 4 : 14 });
   await loc.press("Tab");
-  await delay(500);
+  await delay(140);
 
   if (fechasValorEquivalentes(await loc.inputValue(), fecha)) return;
 
   await establecerValorInputAngular(page, name, fecha);
-  await delay(400);
+  await delay(90);
   if (fechasValorEquivalentes(await loc.inputValue(), fecha)) return;
 
   await loc.click({ force: true });
   await page.keyboard.press("Escape").catch(() => {});
-  await delay(200);
+  await delay(50);
   await loc.click({ force: true });
   await page.locator(".p-datepicker").first().waitFor({ state: "visible", timeout: 15_000 });
-  await delay(350);
+  await delay(90);
 
   for (let _g = 0; _g < 32; _g++) {
     const title = await page.locator(".p-datepicker .p-datepicker-title").first().textContent().catch(() => "") ?? "";
@@ -319,7 +335,7 @@ async function establecerFechaPublicacionCampo(page: Page, name: string, fecha: 
         timeout: 4000,
       });
     });
-    await delay(280);
+    await delay(70);
   }
 
   await page
@@ -337,14 +353,15 @@ async function establecerFechaPublicacionCampo(page: Page, name: string, fecha: 
     });
 
   await page.keyboard.press("Escape").catch(() => {});
-  await delay(450);
+  await delay(110);
 }
 
 async function limpiarFormularioFiltros(page: Page): Promise<void> {
+  if (process.env.COMPRASMX_SKIP_LIMPIAR === "1") return;
   const btn = page.getByRole("button", { name: /^limpiar$/i }).first();
   if (await btn.isVisible().catch(() => false)) {
     await btn.click();
-    await delay(fastMode() ? 550 : 1000);
+    await delay(fastMode() ? 160 : 280);
   }
 }
 
@@ -359,7 +376,7 @@ async function leerTotalPiePortal(page: Page): Promise<number | null> {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
-/** Espera a que el portal muestre "Total: N" para la búsqueda actual. */
+/** Espera resultado de Buscar: spinner y luego sondeo corto (no acumula pausas largas). */
 async function esperarRespuestaBusqueda(
   page: Page,
   navTimeoutMs: number,
@@ -367,42 +384,49 @@ async function esperarRespuestaBusqueda(
 ): Promise<{ totalPie: number | null; sinResultados: boolean }> {
   const vacio = page.getByText(/No se encontraron resultados\s+para tu búsqueda|No se encontraron resultados/i);
   const start = Date.now();
+  const loading = page.locator(".p-datatable-loading, .p-blockui").first();
+
+  if (await loading.isVisible().catch(() => false)) {
+    await loading.waitFor({ state: "hidden", timeout: navTimeoutMs }).catch(() => {});
+  }
+
+  const poll = fastMode() ? 16 : 42;
+  let mismoPrevAcum = 0;
+
   while (Date.now() - start < navTimeoutMs) {
-    const loading = page.locator(".p-datatable-loading, .p-blockui");
-    if ((await loading.count()) > 0) {
-      await loading.first().waitFor({ state: "hidden", timeout: 8000 }).catch(() => {});
+    if (await vacio.isVisible().catch(() => false)) {
+      return { totalPie: 0, sinResultados: true };
     }
 
-    if (await vacio.isVisible().catch(() => false)) {
-      await delay(400);
-      return { totalPie: 0, sinResultados: true };
+    if (await loading.isVisible().catch(() => false)) {
+      await loading.waitFor({ state: "hidden", timeout: Math.min(20_000, navTimeoutMs) }).catch(() => {});
+      mismoPrevAcum = 0;
+      continue;
     }
 
     const totalPie = await leerTotalPiePortal(page);
     if (totalPie !== null) {
-      // Si el total no cambió, normalmente leímos el estado anterior mientras la SPA terminaba de refrescar.
       if (
         totalPieAntes !== undefined &&
         totalPieAntes !== null &&
         Number.isFinite(totalPieAntes) &&
         totalPie === totalPieAntes
       ) {
-        await delay(250);
+        mismoPrevAcum += poll;
+        await sleep(poll);
+        if (mismoPrevAcum > (fastMode() ? 2000 : 5000)) {
+          return { totalPie, sinResultados: false };
+        }
         continue;
       }
-
-      // Estabilidad: intentamos leer "Total" dos veces para evitar valores parciales.
-      await delay(fastMode() ? 280 : 500);
+      await sleep(fastMode() ? 22 : 55);
       const total2 = await leerTotalPiePortal(page);
       if (total2 !== null && total2 === totalPie) {
         return { totalPie, sinResultados: false };
       }
-
-      await delay(300);
-      continue;
     }
 
-    await delay(320);
+    await sleep(poll);
   }
   return { totalPie: await leerTotalPiePortal(page), sinResultados: false };
 }
@@ -414,19 +438,19 @@ async function extraerFilasConReintentos(
 ): Promise<ComprasmxFila[]> {
   if (sinResultados) return [];
   if (totalEsperado === 0) return [];
-  const maxRounds = fastMode() ? 6 : 10;
+  const maxRounds = fastMode() ? 5 : 8;
   let filas: ComprasmxFila[] = [];
   for (let r = 0; r < maxRounds; r++) {
     filas = await extraerFilasNumeroyNombre(page);
     if (totalEsperado !== null && totalEsperado > 0) {
       if (filas.length >= totalEsperado) return filas.slice(0, totalEsperado);
       if (filas.length > 0 && filas.length < totalEsperado) {
-        await delay(900);
+        await delay(200);
         continue;
       }
     }
     if (filas.length > 0) break;
-    await delay(900);
+    await delay(200);
   }
   if (totalEsperado !== null && totalEsperado > 0 && filas.length > totalEsperado) {
     return filas.slice(0, totalEsperado);
@@ -439,6 +463,26 @@ async function leerValoresFechaPublicacionDom(page: Page): Promise<{ desde: stri
     desde: (await page.locator('input[name="fechaDesdeP"]').inputValue().catch(() => "")).trim(),
     hasta: (await page.locator('input[name="fechaHastaP"]').inputValue().catch(() => "")).trim(),
   };
+}
+
+/** Marca varias entidades en un solo tick (evita N round-trips de Playwright). */
+async function marcarEntidadesMultiselectEnDom(page: Page, entidades: string[]): Promise<void> {
+  const list = entidades.map((e) => e.trim()).filter(Boolean);
+  if (list.length === 0) return;
+  await page.evaluate(
+    `(function(names){
+      function norm(s){return (s||"").replace(/\\s+/g," ").trim().toLowerCase().normalize("NFD").replace(/[\\u0300-\\u036f]/g,"");}
+      var set = {};
+      for (var i=0;i<names.length;i++) set[norm(names[i])]=1;
+      var sel = ".p-multiselect-panel .p-multiselect-item, .p-multiselect-items .p-multiselect-item, .p-overlay-open .p-multiselect-item, .p-multiselect-item";
+      var items = document.querySelectorAll(sel);
+      for (var j=0;j<items.length;j++){
+        var el = items[j];
+        var t = norm(el.textContent||"");
+        if (set[t]) el.click();
+      }
+    })(${JSON.stringify(list)})`,
+  );
 }
 
 function escapeRegex(s: string): string {
@@ -465,7 +509,7 @@ async function scrollPanelFiltrosAlInicio(page: Page): Promise<void> {
       try { nodes[i].scrollTop = 0; } catch (e) {}
     }
   })()`);
-  await delay(150);
+  await delay(40);
 }
 
 /**
@@ -475,7 +519,7 @@ async function scrollPanelFiltrosAlInicio(page: Page): Promise<void> {
 async function asegurarBotonBuscarVisible(page: Page): Promise<void> {
   const buscar = page.locator("form.sizetext").getByRole("button", { name: /^buscar$/i });
   await buscar.scrollIntoViewIfNeeded({ timeout: 15_000 }).catch(() => {});
-  await delay(200);
+  await delay(25);
 }
 
 async function clickBuscar(page: Page, navTimeoutMs: number): Promise<void> {
@@ -489,14 +533,14 @@ async function clickBuscar(page: Page, navTimeoutMs: number): Promise<void> {
   await page.evaluate(
     `(function(){var f=document.querySelector('form.sizetext');if(f&&typeof f.requestSubmit==='function')f.requestSubmit();})()`,
   );
-  await delay(400);
+  await delay(50);
 }
 
 async function abrirPanelFiltros(page: Page): Promise<void> {
   const filtros = page.getByRole("button", { name: /filtros/i }).first();
   await filtros.waitFor({ state: "visible", timeout: 90_000 });
   const fechaInput = page.locator('input[name="fechaDesdeP"]');
-  const panelPause = fastMode() ? 900 : 1600;
+  const panelPause = fastMode() ? 260 : 420;
   if (!(await fechaInput.isVisible().catch(() => false))) {
     await filtros.click();
     await delay(panelPause);
@@ -508,13 +552,11 @@ async function abrirPanelFiltros(page: Page): Promise<void> {
   await fechaInput.waitFor({ state: "visible", timeout: 60_000 });
 }
 
+/** Cierra el panel del multiselect sin pausas artificiales; luego el caller pulsa Buscar. */
 async function cerrarOverlayMultiselect(page: Page, multiselect: ReturnType<Page["locator"]>): Promise<void> {
-  await page.keyboard.press("Escape");
-  await delay(fastMode() ? 200 : 350);
-  await multiselect.locator(".p-multiselect").click();
-  await delay(fastMode() ? 120 : 250);
-  await page.keyboard.press("Escape");
-  await delay(fastMode() ? 200 : 450);
+  await page.keyboard.press("Escape").catch(() => {});
+  await multiselect.locator(".p-multiselect").click().catch(() => {});
+  await page.keyboard.press("Escape").catch(() => {});
 }
 
 /**
@@ -636,11 +678,11 @@ async function cerrarDetalleYLiberarListado(listPage: Page, detailPage: Page, mo
   if (mode === "popup") {
     await detailPage.close().catch(() => {});
     await listPage.bringToFront().catch(() => {});
-    await delay(fastMode() ? 200 : 400);
+    await delay(fastMode() ? 60 : 120);
     return;
   }
   await listPage.goBack({ waitUntil: "domcontentloaded" }).catch(() => {});
-  await delay(fastMode() ? 500 : 900);
+  await delay(fastMode() ? 180 : 300);
   await listPage.locator("tbody tr").first().waitFor({ state: "visible", timeout: 30_000 }).catch(() => {});
 }
 
@@ -746,13 +788,13 @@ async function revelarScrollHorizontalTablaAnexos(widget: Locator): Promise<void
       });
     })
     .catch(() => {});
-  await delay(fastMode() ? 160 : 380);
+  await delay(fastMode() ? 50 : 100);
 }
 
 async function prepararSeccionAnexosVisible(page: Page): Promise<void> {
   const head = page.getByText(/^\s*ANEXOS\s*$/i).first();
   if (await head.count()) await head.scrollIntoViewIfNeeded().catch(() => {});
-  await delay(fastMode() ? 220 : 550);
+  await delay(fastMode() ? 70 : 140);
   await page
     .locator("tbody i.pi-download, i.pi-download")
     .first()
@@ -853,7 +895,7 @@ async function descargarAnexosPorIconosDescargar(page: Page, expedienteListadoId
     if (dest) {
       out.push({ titulo, archivoLocal: dest });
       saved += 1;
-      await delay(fastMode() ? 120 : 280);
+      await delay(fastMode() ? 35 : 70);
     }
   }
 
@@ -1192,8 +1234,8 @@ async function extraerDetalleProcedimientoDesdePage(
 ): Promise<ComprasmxDetalleProcedimiento> {
   try {
     await page.locator(".layout-main, main, app-root").first().waitFor({ state: "visible", timeout: 20_000 }).catch(() => {});
-    await page.waitForLoadState("networkidle", { timeout: 12_000 }).catch(() => {});
-    await delay(fastMode() ? 500 : 1100);
+    await page.waitForLoadState("domcontentloaded", { timeout: 10_000 }).catch(() => {});
+    await delay(fastMode() ? 80 : 160);
     await prepararSeccionAnexosVisible(page);
     const id = expedienteListadoId?.trim() ?? "";
     const anexosDescargados = id ? await descargarAnexosPorIconosDescargar(page, id) : [];
@@ -1235,7 +1277,7 @@ async function extraerDetalleProcedimientoDesdePage(
 export type FetchComprasmxOptions = {
   /**
    * `true`/`false`: forzar modo con o sin ventana.
-   * `undefined`: ventana visible por defecto; `PLAYWRIGHT_HEADLESS=1` para headless (CI/servidor sin display).
+   * `undefined`: headless por defecto (rápido). `PLAYWRIGHT_HEADED=1` o `?headed=1` para ventana visible.
    */
   headed?: boolean;
   /** Fecha publicación «desde», formato `DD/MM/AAAA`. Si no viene, se usa hoy (CDMX). */
@@ -1345,12 +1387,12 @@ async function navegarSitioPublicoComprasmx(page: Page, navTimeoutMs: number): P
     } catch (e) {
       lastErr = e;
       if (attempt >= attempts) break;
-      await delay(Math.min(12_000, 1200 * attempt ** 2));
+      await delay(Math.min(4_000, 350 * attempt));
     }
   }
   const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
   throw new Error(
-    `No se pudo abrir Compras MX (${msg}). Revisa red o VPN; opciones: COMPRASMX_NAV_TIMEOUT_MS=180000, COMPRASMX_GOTO_RETRIES=5, COMPRASMX_GOTO_WAIT_UNTIL=domcontentloaded, ?headed=0 o PLAYWRIGHT_HEADLESS=1 si no hay display.`,
+    `No se pudo abrir Compras MX (${msg}). Revisa red o VPN; opciones: COMPRASMX_NAV_TIMEOUT_MS=180000, COMPRASMX_GOTO_RETRIES=5, COMPRASMX_GOTO_WAIT_UNTIL=domcontentloaded, ?headed=1 o PLAYWRIGHT_HEADED=1 para ver el navegador.`,
     { cause: lastErr instanceof Error ? lastErr : undefined },
   );
 }
@@ -1368,12 +1410,13 @@ function ensureBrowserShutdownHooks(): void {
   process.once("SIGTERM", closeAll);
 }
 
-/** Por defecto: ventana visible. `PLAYWRIGHT_HEADLESS=1` o `?headed=0` para headless. */
+/** Por defecto headless (rápido en API/Postman). `PLAYWRIGHT_HEADED=1` o `?headed=1` para ver el navegador. */
 function resolveHeaded(explicit?: boolean): boolean {
   if (explicit === false) return false;
   if (explicit === true) return true;
+  if (process.env.PLAYWRIGHT_HEADED === "1") return true;
   if (process.env.PLAYWRIGHT_HEADLESS === "1") return false;
-  return true;
+  return false;
 }
 
 export async function fetchComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<ComprasmxSnapshot> {
@@ -1425,11 +1468,8 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
     page.setDefaultNavigationTimeout(navTimeoutMs);
 
     await navegarSitioPublicoComprasmx(page, navTimeoutMs);
-    await delay(fastMode() ? 800 : 1500);
 
     await abrirPanelFiltros(page);
-
-    await delay(fastMode() ? 350 : 800);
 
     await scrollPanelFiltrosAlInicio(page);
 
@@ -1438,20 +1478,17 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
     const pestana = pestanaEnv();
     await configurarVistaListado(page, pestana);
 
-    await establecerFechaPublicacionCampo(page, "fechaDesdeP", fechaDesde);
-    await establecerFechaPublicacionCampo(page, "fechaHastaP", fechaHasta);
+    if (!(await intentarEstablecerFechasPublicacionEvaluate(page, fechaDesde, fechaHasta))) {
+      await establecerFechaPublicacionCampo(page, "fechaDesdeP", fechaDesde);
+      await establecerFechaPublicacionCampo(page, "fechaHastaP", fechaHasta);
+    }
 
     const domFechas = await leerValoresFechaPublicacionDom(page);
 
     const multiselect = page.locator('p-multiselect[name="entidades"]');
     await multiselect.locator(".p-multiselect").click();
-    await delay(fastMode() ? 450 : 800);
-
-    for (const nombre of entidades) {
-      const rx = new RegExp(`^${escapeRegex(nombre)}$`, "i");
-      await page.locator(".p-multiselect-item").filter({ hasText: rx }).first().click();
-      await delay(140);
-    }
+    await page.locator(".p-multiselect-item").first().waitFor({ state: "visible", timeout: 12_000 }).catch(() => {});
+    await marcarEntidadesMultiselectEnDom(page, entidades);
 
     await cerrarOverlayMultiselect(page, multiselect);
 
