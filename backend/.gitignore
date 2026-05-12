@@ -1,5 +1,6 @@
 node_modules/
 dist/
+comprasmx-anexos/
 .env
 .env.local
 *.log

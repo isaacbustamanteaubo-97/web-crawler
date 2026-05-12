@@ -1,4 +1,6 @@
-import { chromium, type Browser, type Page } from "playwright";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright";
 
 const SOURCE_URL =
   "https://comprasmx.buengobierno.gob.mx/sitiopublico/#/";
@@ -85,7 +87,10 @@ export function parseEntidadesFederativasCliente(raw: unknown): { values?: strin
 
 export type ComprasmxAnexo = {
   titulo: string;
-  urlDescarga: string;
+  /** Enlace directo si el DOM lo expone (poco frecuente en ANEXOS). */
+  urlDescarga?: string;
+  /** Ruta absoluta tras hacer clic en el icono PrimeNG `pi-download` (Playwright `download.saveAs`). */
+  archivoLocal?: string;
 };
 
 export type ComprasmxDetalleProcedimiento = {
@@ -668,8 +673,192 @@ type RawDetalleProcedimiento = {
   aplicaJuntaAclaraciones: string | null;
   fechaHoraActoFallo: string | null;
   entidadFederativaContratacion: string | null;
-  anexos: ComprasmxAnexo[];
+  anexos: Array<{ titulo: string; urlDescarga: string }>;
 };
+
+function expedienteParaNombreCarpeta(id: string): string {
+  const s = id
+    .replace(/[^\p{L}\p{N}._-]+/gu, "_")
+    .replace(/_+/g, "_")
+    .slice(0, 120);
+  return s.length ? s : "sin-expediente";
+}
+
+/** Por defecto carpeta bajo `process.cwd()` para que los PDF aparezcan junto al proyecto al desarrollar. */
+function baseDirAnexosComprasmx(): string {
+  const fromEnv = process.env.COMPRASMX_ANEXOS_DIR?.trim();
+  if (fromEnv) return fromEnv;
+  return path.join(process.cwd(), "comprasmx-anexos");
+}
+
+/**
+ * PrimeNG a menudo pone `<thead>` en una tabla y `<tbody>` en otra (scrollable / frozen).
+ * Filtrar un solo `<table>` falla siempre → hay que anclar al widget `p-table` / `.p-datatable`.
+ */
+async function localizarWidgetTablaAnexos(page: Page): Promise<Locator | null> {
+  const head = page.getByText(/^\s*ANEXOS\s*$/i).first();
+  if (await head.count()) await head.scrollIntoViewIfNeeded().catch(() => {});
+
+  const panel = page.locator(".p-panel, .p-fieldset, section").filter({ has: page.getByText(/^\s*ANEXOS\s*$/i) }).first();
+  if (await panel.count()) {
+    const scoped = panel.locator("p-table, .p-datatable").filter({
+      has: panel.locator("th").filter({ hasText: /Tipo de documento/i }),
+    }).filter({
+      has: panel.locator("th").filter({ hasText: /Acci[oó]n(es)?/i }),
+    }).filter({
+      has: panel.locator("tbody i.pi-download, tbody .pi-download"),
+    });
+    if ((await scoped.count()) > 0) return scoped.first();
+    const scopedLoose = panel.locator("p-table, .p-datatable").filter({
+      has: panel.locator("tbody i.pi-download, tbody .pi-download"),
+    });
+    if ((await scopedLoose.count()) > 0) return scopedLoose.first();
+  }
+
+  const widgets = page.locator("p-table, .p-datatable").filter({
+    has: page.locator("th").filter({ hasText: /Tipo de documento/i }),
+  }).filter({
+    has: page.locator("th").filter({ hasText: /Acci[oó]n(es)?/i }),
+  }).filter({
+    has: page.locator("tbody i.pi-download, tbody .pi-download"),
+  });
+  if ((await widgets.count()) > 0) return widgets.first();
+
+  const loose = page.locator("p-table, .p-datatable").filter({
+    has: page.locator("tbody i.pi-download, tbody .pi-download"),
+  });
+  if ((await loose.count()) > 0) return loose.first();
+  return null;
+}
+
+/** Tablas PrimeNG scrollables a veces dejan la columna de acción fuera del viewport horizontal. */
+async function revelarScrollHorizontalTablaAnexos(widget: Locator): Promise<void> {
+  await widget
+    .evaluate((root) => {
+      if (!(root instanceof HTMLElement)) return;
+      const candidates = root.querySelectorAll(
+        ".p-datatable-scrollable-body, .p-datatable-wrapper, .p-scroller, .p-scroller-content",
+      );
+      candidates.forEach((el) => {
+        if (el instanceof HTMLElement && el.scrollWidth > el.clientWidth + 1) {
+          el.scrollLeft = el.scrollWidth;
+        }
+      });
+    })
+    .catch(() => {});
+  await delay(fastMode() ? 160 : 380);
+}
+
+async function prepararSeccionAnexosVisible(page: Page): Promise<void> {
+  const head = page.getByText(/^\s*ANEXOS\s*$/i).first();
+  if (await head.count()) await head.scrollIntoViewIfNeeded().catch(() => {});
+  await delay(fastMode() ? 220 : 550);
+  await page
+    .locator("tbody i.pi-download, i.pi-download")
+    .first()
+    .waitFor({ state: "visible", timeout: 35_000 })
+    .catch(() => {});
+}
+
+/**
+ * El portal no expone `href` en ANEXOS: hay que pulsar `i.pi-download` y capturar el evento `download`
+ * (o una pestaña nueva con PDF). `COMPRASMX_SKIP_ANEXO_DOWNLOAD=1` lo desactiva.
+ * `COMPRASMX_ANEXOS_DIR`: carpeta base (por defecto `<cwd>/comprasmx-anexos`).
+ */
+async function guardarArchivoTrasClicDescarga(
+  page: Page,
+  icon: Locator,
+  sessionDir: string,
+  filePrefix: string,
+  perFileMs: number,
+): Promise<string | null> {
+  const ctx = page.context();
+  const dPromise = page.waitForEvent("download", { timeout: perFileMs });
+  const pPromise = ctx.waitForEvent("page", { timeout: perFileMs });
+  await icon.scrollIntoViewIfNeeded().catch(() => {});
+  await icon.click({ timeout: 15_000 });
+  const settled = await Promise.allSettled([dPromise, pPromise]);
+  const dRes = settled[0];
+  const pRes = settled[1];
+  if (dRes.status === "fulfilled") {
+    const download = dRes.value;
+    const suggested = download.suggestedFilename() || `${filePrefix}.bin`;
+    const dest = path.join(sessionDir, `${filePrefix}_${suggested.replace(/[/\\]/g, "_")}`);
+    await download.saveAs(dest);
+    return dest;
+  }
+  if (pRes.status === "fulfilled") {
+    const np = pRes.value;
+    try {
+      await np.waitForLoadState("domcontentloaded", { timeout: 28_000 }).catch(() => {});
+      const url = np.url();
+      if (url.startsWith("http") && /\.pdf(\?|#|$)/i.test(url)) {
+        const resp = await page.request.get(url);
+        if (resp.ok()) {
+          const dest = path.join(sessionDir, `${filePrefix}_documento.pdf`);
+          await fs.writeFile(dest, await resp.body());
+          await np.close().catch(() => {});
+          return dest;
+        }
+      }
+      await np.close().catch(() => {});
+    } catch {
+      await np.close().catch(() => {});
+    }
+  }
+  return null;
+}
+
+async function descargarAnexosPorIconosDescargar(page: Page, expedienteListadoId: string): Promise<ComprasmxAnexo[]> {
+  if (process.env.COMPRASMX_SKIP_ANEXO_DOWNLOAD === "1") return [];
+  const rawMax = parseInt(process.env.COMPRASMX_ANEXOS_MAX ?? "25", 10);
+  const max = Math.min(100, Math.max(1, Number.isFinite(rawMax) ? rawMax : 25));
+  const timeoutMs = Number(process.env.COMPRASMX_ANEXO_DOWNLOAD_TIMEOUT_MS);
+  const perFileMs = Number.isFinite(timeoutMs) && timeoutMs > 5_000 ? timeoutMs : 75_000;
+
+  const widget = await localizarWidgetTablaAnexos(page);
+  if (!widget) return [];
+  await revelarScrollHorizontalTablaAnexos(widget);
+
+  const rows = widget.locator("tbody tr").filter({ has: widget.locator("i.pi-download") });
+  const rowCount = await rows.count();
+  const iconSel = "i.pi-download.p-element, i.p-element.pi-download, i.pi-download";
+  const out: ComprasmxAnexo[] = [];
+
+  const baseDir = baseDirAnexosComprasmx();
+  const sessionDir = path.join(baseDir, expedienteParaNombreCarpeta(expedienteListadoId));
+  await fs.mkdir(sessionDir, { recursive: true });
+
+  let saved = 0;
+  for (let i = 0; i < rowCount && saved < max; i++) {
+    const row = rows.nth(i);
+    await row.scrollIntoViewIfNeeded().catch(() => {});
+    const icon = row.locator(iconSel).first();
+    await icon.waitFor({ state: "visible", timeout: 12_000 }).catch(() => {});
+    if ((await icon.count()) === 0) continue;
+
+    const cells = row.locator("td");
+    const cellText = async (idx: number) =>
+      (await cells.nth(idx).innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+
+    const num = await cellText(0);
+    const tipo = await cellText(1);
+    const desc = await cellText(2);
+    const titulo =
+      [tipo, desc].filter(Boolean).join(" — ").slice(0, 240) ||
+      (num ? `Anexo ${num}` : `Anexo ${saved + 1}`);
+
+    const prefix = String(saved + 1).padStart(2, "0");
+    const dest = await guardarArchivoTrasClicDescarga(page, icon, sessionDir, prefix, perFileMs);
+    if (dest) {
+      out.push({ titulo, archivoLocal: dest });
+      saved += 1;
+      await delay(fastMode() ? 120 : 280);
+    }
+  }
+
+  return out;
+}
 
 const EXTRACT_PROCEDIMIENTO_UI_SCRIPT = `(() => {
   function norm(s) { return (s || "").replace(/\\s+/g, " ").trim(); }
@@ -997,13 +1186,28 @@ const EXTRACT_PROCEDIMIENTO_UI_SCRIPT = `(() => {
   };
 })()`;
 
-async function extraerDetalleProcedimientoDesdePage(page: Page): Promise<ComprasmxDetalleProcedimiento> {
+async function extraerDetalleProcedimientoDesdePage(
+  page: Page,
+  expedienteListadoId?: string,
+): Promise<ComprasmxDetalleProcedimiento> {
   try {
     await page.locator(".layout-main, main, app-root").first().waitFor({ state: "visible", timeout: 20_000 }).catch(() => {});
     await page.waitForLoadState("networkidle", { timeout: 12_000 }).catch(() => {});
     await delay(fastMode() ? 500 : 1100);
+    await prepararSeccionAnexosVisible(page);
+    const id = expedienteListadoId?.trim() ?? "";
+    const anexosDescargados = id ? await descargarAnexosPorIconosDescargar(page, id) : [];
     const raw = (await page.evaluate(EXTRACT_PROCEDIMIENTO_UI_SCRIPT)) as RawDetalleProcedimiento;
-    const anexos = Array.isArray(raw?.anexos) ? raw.anexos : [];
+    const anexosLinks: ComprasmxAnexo[] = Array.isArray(raw?.anexos)
+      ? raw.anexos.map((a) => ({ titulo: a.titulo, urlDescarga: a.urlDescarga }))
+      : [];
+    const urlsEnDescargados = new Set(
+      anexosDescargados.map((a) => a.urlDescarga).filter((u): u is string => Boolean(u)),
+    );
+    const anexos = [
+      ...anexosDescargados,
+      ...anexosLinks.filter((a) => a.urlDescarga && !urlsEnDescargados.has(a.urlDescarga)),
+    ];
     return {
       numeroProcedimientoContratacion: raw?.numeroProcedimientoContratacion ?? null,
       datosGenerales: {
@@ -1031,7 +1235,7 @@ async function extraerDetalleProcedimientoDesdePage(page: Page): Promise<Compras
 export type FetchComprasmxOptions = {
   /**
    * `true`/`false`: forzar modo con o sin ventana.
-   * `undefined`: headless por defecto; `PLAYWRIGHT_HEADED=1` para ventana visible.
+   * `undefined`: ventana visible por defecto; `PLAYWRIGHT_HEADLESS=1` para headless (CI/servidor sin display).
    */
   headed?: boolean;
   /** Fecha publicación «desde», formato `DD/MM/AAAA`. Si no viene, se usa hoy (CDMX). */
@@ -1086,13 +1290,69 @@ export async function warmComprasmxBrowser(): Promise<void> {
   await obtainSharedBrowser(headed, width, height);
 }
 
+/**
+ * Bloquea imágenes y media (ahorro de ancho de banda). Las fuentes no se bloquean por defecto:
+ * PrimeIcons (`pi-download` en ANEXOS) depende de `@font-face`; bloquearlas deja la columna Acción vacía.
+ * `COMPRASMX_BLOCK_FONT_RESOURCES=1` restaura el bloqueo de fuentes. `COMPRASMX_NO_BLOCK_RESOURCES=1` desactiva todo.
+ */
 async function instalarBloqueoRecursosLigeros(page: Page): Promise<void> {
   if (process.env.COMPRASMX_NO_BLOCK_RESOURCES === "1") return;
+  const blockFonts = process.env.COMPRASMX_BLOCK_FONT_RESOURCES === "1";
   await page.route("**/*", (route) => {
     const rt = route.request().resourceType();
-    if (rt === "image" || rt === "media" || rt === "font") return route.abort();
+    if (rt === "image" || rt === "media") return route.abort();
+    if (blockFonts && rt === "font") return route.abort();
     return route.continue();
   });
+}
+
+/**
+ * SPAs con `#/` a veces no disparan bien la señal de `domcontentloaded` en el plazo esperado.
+ * Por defecto: `waitUntil: "commit"` + espera a `domcontentloaded` con timeout acotado.
+ * `COMPRASMX_GOTO_WAIT_UNTIL=domcontentloaded|load` restaura otro modo. `COMPRASMX_GOTO_RETRIES` (1–8, default 3).
+ */
+function gotoWaitUntilEnv(): "commit" | "domcontentloaded" | "load" {
+  const w = (process.env.COMPRASMX_GOTO_WAIT_UNTIL ?? "").trim().toLowerCase();
+  if (w === "domcontentloaded" || w === "load") return w;
+  return "commit";
+}
+
+function gotoMaxAttempts(): number {
+  const raw = process.env.COMPRASMX_GOTO_RETRIES?.trim();
+  const n = raw ? parseInt(raw, 10) : 3;
+  if (!Number.isFinite(n) || n < 1) return 3;
+  return Math.min(8, Math.max(1, n));
+}
+
+async function navegarSitioPublicoComprasmx(page: Page, navTimeoutMs: number): Promise<void> {
+  const waitUntil = gotoWaitUntilEnv();
+  const attempts = gotoMaxAttempts();
+  const secondaryWait = Math.min(60_000, Math.max(15_000, Math.floor(navTimeoutMs / 2)));
+
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await page.goto(SOURCE_URL, { waitUntil, timeout: navTimeoutMs });
+      if (waitUntil === "commit") {
+        await page.waitForLoadState("domcontentloaded", { timeout: secondaryWait }).catch(() => {});
+      }
+      await page
+        .locator("app-root, .layout-main, body")
+        .first()
+        .waitFor({ state: "attached", timeout: 15_000 })
+        .catch(() => {});
+      return;
+    } catch (e) {
+      lastErr = e;
+      if (attempt >= attempts) break;
+      await delay(Math.min(12_000, 1200 * attempt ** 2));
+    }
+  }
+  const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+  throw new Error(
+    `No se pudo abrir Compras MX (${msg}). Revisa red o VPN; opciones: COMPRASMX_NAV_TIMEOUT_MS=180000, COMPRASMX_GOTO_RETRIES=5, COMPRASMX_GOTO_WAIT_UNTIL=domcontentloaded, ?headed=0 o PLAYWRIGHT_HEADLESS=1 si no hay display.`,
+    { cause: lastErr instanceof Error ? lastErr : undefined },
+  );
 }
 
 let browserShutdownHooks = false;
@@ -1108,13 +1368,12 @@ function ensureBrowserShutdownHooks(): void {
   process.once("SIGTERM", closeAll);
 }
 
-/** Por defecto: headless (sin ventana). `PLAYWRIGHT_HEADED=1` o `?headed=1` para ver el navegador. */
+/** Por defecto: ventana visible. `PLAYWRIGHT_HEADLESS=1` o `?headed=0` para headless. */
 function resolveHeaded(explicit?: boolean): boolean {
   if (explicit === false) return false;
   if (explicit === true) return true;
-  if (process.env.PLAYWRIGHT_HEADED === "1") return true;
   if (process.env.PLAYWRIGHT_HEADLESS === "1") return false;
-  return false;
+  return true;
 }
 
 export async function fetchComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<ComprasmxSnapshot> {
@@ -1134,6 +1393,7 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
   const headed = resolveHeaded(opts?.headed);
   const reuseBrowser = process.env.COMPRASMX_REUSE_BROWSER !== "0";
   let page: Page | undefined;
+  let browserContext: BrowserContext | undefined;
   let disposableBrowser: Browser | undefined;
 
   try {
@@ -1150,11 +1410,13 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
       browser = disposableBrowser;
     }
 
-    page = await browser.newPage({
+    browserContext = await browser.newContext({
+      acceptDownloads: true,
       locale: "es-MX",
       timezoneId: TZ,
       viewport: { width, height },
     });
+    page = await browserContext.newPage();
 
     await instalarBloqueoRecursosLigeros(page);
 
@@ -1162,7 +1424,7 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
     page.setDefaultTimeout(navTimeoutMs);
     page.setDefaultNavigationTimeout(navTimeoutMs);
 
-    await page.goto(SOURCE_URL, { waitUntil: "domcontentloaded" });
+    await navegarSitioPublicoComprasmx(page, navTimeoutMs);
     await delay(fastMode() ? 800 : 1500);
 
     await abrirPanelFiltros(page);
@@ -1243,7 +1505,7 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
           popupTimeoutMs,
           detMs,
         );
-        const det = await extraerDetalleProcedimientoDesdePage(detailPage);
+        const det = await extraerDetalleProcedimientoDesdePage(detailPage, row.numeroIdentificacion);
         enriched.push({ ...row, detalleProcedimiento: det });
         await cerrarDetalleYLiberarListado(page, detailPage, mode);
       } catch (e) {
@@ -1276,7 +1538,7 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
       totalEnPieDePortal: sinResultados ? 0 : totalPie,
     };
   } finally {
-    await page?.close().catch(() => {});
+    await browserContext?.close().catch(() => {});
     if (disposableBrowser) await disposableBrowser.close().catch(() => {});
   }
 }

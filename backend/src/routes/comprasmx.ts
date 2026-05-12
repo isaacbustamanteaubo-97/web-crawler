@@ -24,7 +24,7 @@ function firstQueryString(q: unknown): string | undefined {
   return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
 }
 
-/** `undefined` si no viene query → headless por defecto en el servicio. */
+/** `undefined` si no viene query → el servicio usa navegador visible por defecto. */
 function parseHeadedQuery(q: unknown): boolean | undefined {
   const raw = Array.isArray(q) ? q[0] : q;
   if (typeof raw !== "string") return undefined;
