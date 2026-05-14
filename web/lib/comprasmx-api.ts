@@ -33,3 +33,32 @@ export function proxiedComprasmxUrl(pathOrUrl: string): string {
   }
   return `${base}/${pathOrUrl}`;
 }
+
+/**
+ * Mensaje claro cuando `fetch` al API falla por red (backend apagado, proxy de Next sin destino, etc.).
+ * El historial en `localStorage` solo guarda URLs; los bytes siguen en el servidor.
+ */
+export function mensajeErrorConexionComprasmxApi(err: unknown, context: "pdf" | "documentos" | "generico" = "generico"): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const t = raw.toLowerCase();
+  const pareceRed =
+    raw === "proxy" ||
+    (err instanceof TypeError && (t.includes("fetch") || t.includes("failed to load"))) ||
+    t.includes("failed to fetch") ||
+    t.includes("networkerror") ||
+    t.includes("network request failed") ||
+    t.includes("load failed") ||
+    t.includes("econnrefused");
+
+  if (pareceRed) {
+    const detalle =
+      context === "pdf"
+        ? "No se pudo obtener el archivo para la vista previa."
+        : context === "documentos"
+          ? "No se pudo listar los documentos del expediente."
+          : "No se pudo completar la petición al API.";
+    return `${detalle} El navegador solo tiene enlaces guardados; el backend (p. ej. http://127.0.0.1:8000) debe estar en marcha para que el proxy de Next (/api/comprasmx) pueda servirlos. Si usas otro host o puerto, revisa next.config y las variables de entorno del front.`;
+  }
+  if (t.includes("aborted")) return "Solicitud cancelada.";
+  return raw.length > 800 ? `${raw.slice(0, 797)}…` : raw;
+}

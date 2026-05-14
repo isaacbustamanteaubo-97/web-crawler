@@ -1,7 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { comprasmxApiBase, proxiedComprasmxUrl } from "@/lib/comprasmx-api";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { comprasmxApiBase, mensajeErrorConexionComprasmxApi, proxiedComprasmxUrl } from "@/lib/comprasmx-api";
+import {
+  appendSnapshotHistoryEntry,
+  clearSnapshotHistory,
+  getHistoryEntry,
+  listSnapshotHistory,
+  mergeDocumentosIntoHistoryEntry,
+  removeHistoryEntry,
+  type ComprasmxHistoryEntry,
+} from "@/lib/comprasmx-snapshot-history";
 import {
   DEFAULT_ENTIDADES_FEDERATIVAS,
   DEFAULT_PALABRAS_CLAVE,
@@ -38,6 +47,9 @@ type SnapshotResponse = {
   filas: ComprasmxFila[];
   totalFilas: number;
   filtros?: Record<string, unknown>;
+  /** Viene del API al completar el snapshot. */
+  fetchedAt?: string;
+  source?: string;
   error?: string;
 };
 
@@ -173,7 +185,7 @@ function IndicadorCargaVistaPdf({ conversionEnServidor }: { conversionEnServidor
       </p>
       <p className="mx-auto max-w-md text-center text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
         {conversionEnServidor
-          ? "El backend usa LibreOffice cuando aplica; en documentos grandes puede tardar más de un minuto. No cierres el modal hasta que termine."
+          ? "En documentos grandes puede tardar más de un minuto. No cierres el modal hasta que termine."
           : "Obteniendo el archivo para mostrarlo aquí."}
       </p>
     </div>
@@ -219,6 +231,11 @@ export function ComprasmxPanel() {
   const snapshotAbortRef = useRef<AbortController | null>(null);
   const snapshotProgressEndRef = useRef<HTMLDivElement | null>(null);
   const snapshotProcessStartedAtRef = useRef<number | null>(null);
+  /** Entrada de `localStorage` asociada al último snapshot guardado o al elegido en Historial. */
+  const activeHistoryEntryIdRef = useRef<string | null>(null);
+
+  const [historialOpen, setHistorialOpen] = useState(false);
+  const [historialLista, setHistorialLista] = useState<ComprasmxHistoryEntry[]>([]);
 
   useEffect(() => {
     let cancel = false;
@@ -263,6 +280,9 @@ export function ComprasmxPanel() {
       try {
         const r = await fetch(preview.url, { signal: ac.signal });
         if (!r.ok) {
+          if (r.status === 502 || r.status === 503 || r.status === 504) {
+            throw new Error("proxy");
+          }
           const t = await r.text().catch(() => "");
           throw new Error(t.slice(0, 500) || `HTTP ${r.status}`);
         }
@@ -276,7 +296,7 @@ export function ComprasmxPanel() {
         objectUrl = null;
       } catch (e) {
         if (ac.signal.aborted) return;
-        setPdfFetchError(e instanceof Error ? e.message : String(e));
+        setPdfFetchError(mensajeErrorConexionComprasmxApi(e, "pdf"));
       } finally {
         if (!ac.signal.aborted) setPdfLoading(false);
       }
@@ -367,6 +387,7 @@ export function ComprasmxPanel() {
   const ejecutarSnapshot = useCallback(async () => {
     setSnapError(null);
     setSnapshot(null);
+    activeHistoryEntryIdRef.current = null;
     snapshotAbortRef.current?.abort();
 
     const entidadesFederativas = [...entSel].sort((a, b) => a.localeCompare(b, "es"));
@@ -479,6 +500,13 @@ export function ComprasmxPanel() {
         }
         if (o.type === "done" && o.payload && typeof o.payload === "object") {
           setSnapshot(o.payload as SnapshotResponse);
+          const persisted = appendSnapshotHistoryEntry(o.payload);
+          activeHistoryEntryIdRef.current = persisted.ok ? persisted.id : null;
+          if (!persisted.ok) {
+            console.warn(
+              "[comprasmx] No se pudo guardar el snapshot en historial local (p. ej. cuota de almacenamiento).",
+            );
+          }
           setSnapshotProgressLog((prev) => [...prev, { phase: "fin", message: "Resultado recibido.", at: hora() }]);
           streamFinishedWithDone = true;
           setSnapshotStreamDone(true);
@@ -534,16 +562,64 @@ export function ComprasmxPanel() {
     setSnapshotStreamDone(false);
   }, []);
 
+  const abrirHistorial = useCallback(() => {
+    setHistorialLista(listSnapshotHistory());
+    setHistorialOpen(true);
+  }, []);
+
+  const aplicarEntradaHistorial = useCallback((id: string) => {
+    const e = getHistoryEntry(id);
+    if (!e) return;
+    setSnapError(null);
+    setSnapshot(e.snapshotJson as SnapshotResponse);
+    activeHistoryEntryIdRef.current = e.id;
+    setHistorialOpen(false);
+  }, []);
+
+  const eliminarEntradaHistorial = useCallback((id: string, ev?: MouseEvent) => {
+    ev?.stopPropagation();
+    removeHistoryEntry(id);
+    setHistorialLista(listSnapshotHistory());
+    if (activeHistoryEntryIdRef.current === id) {
+      activeHistoryEntryIdRef.current = null;
+      setSnapshot(null);
+    }
+  }, []);
+
+  const vaciarHistorialCompleto = useCallback(() => {
+    clearSnapshotHistory();
+    setHistorialLista([]);
+    activeHistoryEntryIdRef.current = null;
+    setSnapshot(null);
+  }, []);
+
   const abrirDocumentos = useCallback(
     async (numeroIdentificacion: string) => {
-      setDocModal(numeroIdentificacion);
+      const idTrim = numeroIdentificacion.trim();
+      setDocModal(idTrim);
       setDocs([]);
       setDocsError(null);
       setDocZipHref(null);
       setPreview(null);
+
+      const hid = activeHistoryEntryIdRef.current;
+      if (hid) {
+        const entry = getHistoryEntry(hid);
+        const cached = entry?.documentosPorExpediente?.[idTrim];
+        if (cached && cached.length > 0) {
+          const zipHref = proxiedComprasmxUrl(
+            `/comprasmx/documentos/zip?${new URLSearchParams({ numeroIdentificacion: idTrim }).toString()}`,
+          );
+          setDocZipHref(zipHref);
+          setDocs(cached as DocumentoRow[]);
+          setLoadingDocs(false);
+          return;
+        }
+      }
+
       setLoadingDocs(true);
       try {
-        const r = await fetch(`${api}/documentos?${new URLSearchParams({ numeroIdentificacion }).toString()}`);
+        const r = await fetch(`${api}/documentos?${new URLSearchParams({ numeroIdentificacion: idTrim }).toString()}`);
         const j = (await r.json()) as DocumentosResponse & { error?: string };
         if (!r.ok) {
           setDocsError(j.error ?? `Error ${r.status}`);
@@ -553,18 +629,18 @@ export function ComprasmxPanel() {
           typeof j.urlZip === "string"
             ? proxiedComprasmxUrl(j.urlZip)
             : proxiedComprasmxUrl(
-                `/comprasmx/documentos/zip?${new URLSearchParams({ numeroIdentificacion }).toString()}`,
+                `/comprasmx/documentos/zip?${new URLSearchParams({ numeroIdentificacion: idTrim }).toString()}`,
               );
         setDocZipHref(zipHref);
-        setDocs(
-          j.documentos.map((d) => ({
-            ...d,
-            urlDescarga: proxiedComprasmxUrl(d.urlDescarga),
-            ...(d.urlVistaPdf ? { urlVistaPdf: proxiedComprasmxUrl(d.urlVistaPdf) } : {}),
-          })),
-        );
+        const mapped = j.documentos.map((d) => ({
+          ...d,
+          urlDescarga: proxiedComprasmxUrl(d.urlDescarga),
+          ...(d.urlVistaPdf ? { urlVistaPdf: proxiedComprasmxUrl(d.urlVistaPdf) } : {}),
+        }));
+        setDocs(mapped);
+        mergeDocumentosIntoHistoryEntry(activeHistoryEntryIdRef.current, idTrim, mapped);
       } catch (e) {
-        setDocsError(e instanceof Error ? e.message : String(e));
+        setDocsError(mensajeErrorConexionComprasmxApi(e, "documentos"));
       } finally {
         setLoadingDocs(false);
       }
@@ -729,6 +805,110 @@ export function ComprasmxPanel() {
           </div>
         </div>
       ) : null}
+      {historialOpen ? (
+        <div
+          className="fixed inset-0 z-[58] flex items-center justify-center bg-black/50 p-3 sm:p-6"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="historial-local-title"
+        >
+          <div className="flex max-h-[min(88dvh,640px)] w-full max-w-xl flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-950">
+            <div className="shrink-0 border-b border-zinc-200 px-4 py-3 dark:border-zinc-800 sm:px-5">
+              <h2 id="historial-local-title" className="text-base font-semibold text-zinc-900 dark:text-zinc-50">
+                Historial local
+              </h2>
+              <p className="mt-1 text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
+                Cada búsqueda exitosa se guarda en este navegador. Las URLs de documentos apuntan al API (p. ej. vía{" "}
+                <code className="rounded bg-zinc-200 px-0.5 font-mono text-[10px] dark:bg-zinc-800">/api/comprasmx</code>
+                ); hace falta que el <strong>backend esté en marcha</strong> para ver PDFs o listar archivos. Si abriste
+                documentos antes, las rutas se reutilizan; los archivos siguen viviendo en el servidor (no en el
+                navegador).
+              </p>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-4">
+              {historialLista.length === 0 ? (
+                <p className="py-8 text-center text-sm text-zinc-500 dark:text-zinc-400">
+                  Aún no hay snapshots guardados. Ejecuta una búsqueda para crear el primero.
+                </p>
+              ) : (
+                <ul className="flex flex-col gap-2">
+                  {historialLista.map((row) => {
+                    const nDocs = row.documentosPorExpediente
+                      ? Object.values(row.documentosPorExpediente).reduce((a, d) => a + d.length, 0)
+                      : 0;
+                    const storedLabel = new Date(row.storedAt).toLocaleString("es-MX", {
+                      dateStyle: "short",
+                      timeStyle: "short",
+                    });
+                    return (
+                      <li
+                        key={row.id}
+                        className="rounded-lg border border-zinc-200 bg-zinc-50/80 px-3 py-2.5 dark:border-zinc-700 dark:bg-zinc-900/40"
+                      >
+                        <div className="flex flex-wrap items-start justify-between gap-2">
+                          <div className="min-w-0 flex-1">
+                            <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">{row.resumen}</p>
+                            <p className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-400">
+                              Guardado: {storedLabel}
+                              {row.serverFetchedAt ? (
+                                <span className="block font-mono text-[10px] text-zinc-400 dark:text-zinc-500">
+                                  Servidor: {row.serverFetchedAt}
+                                </span>
+                              ) : null}
+                              {nDocs > 0 ? (
+                                <span className="mt-0.5 block text-emerald-700 dark:text-emerald-400">
+                                  {nDocs} documento(s) en caché de URLs
+                                </span>
+                              ) : null}
+                            </p>
+                          </div>
+                          <div className="flex shrink-0 flex-wrap gap-1.5">
+                            <button
+                              type="button"
+                              className="rounded-md bg-emerald-700 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-emerald-800"
+                              onClick={() => aplicarEntradaHistorial(row.id)}
+                            >
+                              Ver
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-md border border-zinc-300 px-2.5 py-1.5 text-xs text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                              onClick={(ev) => eliminarEntradaHistorial(row.id, ev)}
+                            >
+                              Quitar
+                            </button>
+                          </div>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-zinc-200 px-3 py-3 dark:border-zinc-800 sm:px-4">
+              <button
+                type="button"
+                className="rounded-lg border border-red-200 px-3 py-2 text-xs font-medium text-red-800 hover:bg-red-50 disabled:opacity-50 dark:border-red-900 dark:text-red-200 dark:hover:bg-red-950/40"
+                disabled={historialLista.length === 0}
+                onClick={() => {
+                  if (typeof window !== "undefined" && window.confirm("¿Borrar todo el historial local?")) {
+                    vaciarHistorialCompleto();
+                  }
+                }}
+              >
+                Vaciar historial
+              </button>
+              <button
+                type="button"
+                className="rounded-lg bg-zinc-900 px-3 py-2 text-sm font-semibold text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white"
+                onClick={() => setHistorialOpen(false)}
+              >
+                Cerrar
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       <header className="border-b border-zinc-200 pb-6 dark:border-zinc-800">
         <h1 className="text-2xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
           Compras MX — consulta
@@ -854,19 +1034,28 @@ export function ComprasmxPanel() {
           Ejecutar con navegador visible (`?headed=1`) — útil para depurar en el servidor.
         </label>
 
-        <button
-          type="button"
-          disabled={loadingSnap || !requisitosBusqueda.ok}
-          title={
-            !requisitosBusqueda.ok && !loadingSnap
-              ? `Falta: ${requisitosBusqueda.faltantes.join("; ")}.`
-              : undefined
-          }
-          onClick={() => void ejecutarSnapshot()}
-          className="inline-flex items-center justify-center rounded-lg bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-800 disabled:opacity-60"
-        >
-          {loadingSnap ? "Buscando…" : "Buscar licitaciones (snapshot)"}
-        </button>
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            disabled={loadingSnap || !requisitosBusqueda.ok}
+            title={
+              !requisitosBusqueda.ok && !loadingSnap
+                ? `Falta: ${requisitosBusqueda.faltantes.join("; ")}.`
+                : undefined
+            }
+            onClick={() => void ejecutarSnapshot()}
+            className="inline-flex items-center justify-center rounded-lg bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-800 disabled:opacity-60"
+          >
+            {loadingSnap ? "Buscando…" : "Buscar licitaciones (snapshot)"}
+          </button>
+          <button
+            type="button"
+            onClick={abrirHistorial}
+            className="inline-flex items-center justify-center rounded-lg border border-zinc-300 bg-white px-4 py-2.5 text-sm font-semibold text-zinc-800 hover:bg-zinc-50 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+          >
+            Historial local
+          </button>
+        </div>
 
         {!requisitosBusqueda.ok && !loadingSnap ? (
           <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">

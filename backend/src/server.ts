@@ -1,4 +1,5 @@
 import { buildApp } from "./app.js";
+import { iniciarLimpiezaNocturnaAnexos } from "./jobs/midnightAnexosCleanup.js";
 import { warmComprasmxBrowser } from "./services/comprasmx.js";
 
 const port = Number(process.env.PORT) || 8000;
@@ -8,6 +9,7 @@ const app = buildApp();
 
 app.listen(port, host, () => {
   console.log(`Listening on http://${host}:${port}`);
+  iniciarLimpiezaNocturnaAnexos();
   if (process.env.COMPRASMX_WARM_BROWSER === "1") {
     void warmComprasmxBrowser().catch((err) => {
       console.warn("[comprasmx] No se pudo precalentar Chromium.", err);

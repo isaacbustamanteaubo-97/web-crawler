@@ -55,7 +55,8 @@ function hashCacheKey(absolutePath: string, mtimeMs: number, size: number): stri
     .digest("hex");
 }
 
-function cacheDirAbs(): string {
+/** Carpeta donde se guardan los PDF generados por LibreOffice para `vista=pdf` (caché por hash del origen). */
+export function comprasmxOfficePdfCacheDir(): string {
   const fromEnv = process.env.COMPRASMX_OFFICE_PDF_CACHE_DIR?.trim();
   if (fromEnv) return path.resolve(fromEnv);
   return path.join(os.tmpdir(), "comprasmx-office-pdf-cache");
@@ -148,7 +149,7 @@ export async function resolverPdfVistaPrevia(absoluteOrigen: string): Promise<st
     throw new Error(`Archivo demasiado grande para convertir (>${maxBytes()} bytes).`);
   }
 
-  const dir = cacheDirAbs();
+  const dir = comprasmxOfficePdfCacheDir();
   const key = `${hashCacheKey(absoluteOrigen, st.mtimeMs, st.size)}.pdf`;
   const cached = path.join(dir, key);
   try {

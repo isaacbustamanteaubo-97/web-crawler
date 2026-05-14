@@ -809,7 +809,7 @@ function expedienteParaNombreCarpeta(id: string): string {
 }
 
 /** Por defecto carpeta bajo `process.cwd()` para que los PDF aparezcan junto al proyecto al desarrollar. */
-function baseDirAnexosComprasmx(): string {
+export function comprasmxAnexosBaseDir(): string {
   const fromEnv = process.env.COMPRASMX_ANEXOS_DIR?.trim();
   if (fromEnv) return fromEnv;
   return path.join(process.cwd(), "comprasmx-anexos");
@@ -818,7 +818,7 @@ function baseDirAnexosComprasmx(): string {
 /** Misma ruta que usa el crawler al guardar anexos (`expedienteParaNombreCarpeta` + `COMPRASMX_ANEXOS_DIR`). */
 export function carpetaAbsolutaAnexosPorNumeroIdentificacion(numeroIdentificacion: string): string {
   const id = numeroIdentificacion.trim();
-  return path.join(baseDirAnexosComprasmx(), expedienteParaNombreCarpeta(id));
+  return path.join(comprasmxAnexosBaseDir(), expedienteParaNombreCarpeta(id));
 }
 
 export type ComprasmxDocumentoLocalInfo = {
@@ -1076,7 +1076,7 @@ async function descargarAnexosPorIconosDescargar(
   });
 
   const out: ComprasmxAnexo[] = [];
-  const baseDir = baseDirAnexosComprasmx();
+  const baseDir = comprasmxAnexosBaseDir();
   const sessionDir = path.join(baseDir, expedienteParaNombreCarpeta(expedienteListadoId));
   await fs.mkdir(sessionDir, { recursive: true });
 
