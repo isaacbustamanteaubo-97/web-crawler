@@ -6,6 +6,7 @@ import {
   DEFAULT_ENTIDADES_FEDERATIVAS,
   DEFAULT_PALABRAS_CLAVE,
   ENTIDADES_TODAS_FALLBACK,
+  etiquetaEntidadFederativa,
 } from "@/lib/comprasmx-defaults";
 import { esFechaIsoValida, fechaIsoHoyMexico } from "@/lib/fecha-mexico";
 
@@ -78,6 +79,15 @@ type SnapshotProgressLine = {
   at: string;
   detalle?: string;
 };
+
+function formatoDuracionSegundos(totalSec: number): string {
+  const s = Math.max(0, Math.floor(totalSec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
+  return `${m}:${String(r).padStart(2, "0")}`;
+}
 
 function extDeNombre(nombre: string): string {
   const i = nombre.lastIndexOf(".");
@@ -166,8 +176,10 @@ export function ComprasmxPanel() {
   const [snapshotProgressOpen, setSnapshotProgressOpen] = useState(false);
   const [snapshotProgressLog, setSnapshotProgressLog] = useState<SnapshotProgressLine[]>([]);
   const [snapshotStreamDone, setSnapshotStreamDone] = useState(false);
+  const [snapshotElapsedSec, setSnapshotElapsedSec] = useState(0);
   const snapshotAbortRef = useRef<AbortController | null>(null);
   const snapshotProgressEndRef = useRef<HTMLDivElement | null>(null);
+  const snapshotProcessStartedAtRef = useRef<number | null>(null);
 
   useEffect(() => {
     let cancel = false;
@@ -242,6 +254,17 @@ export function ComprasmxPanel() {
     snapshotProgressEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [snapshotProgressOpen, snapshotProgressLog]);
 
+  useEffect(() => {
+    if (!snapshotProgressOpen) return;
+    const start = snapshotProcessStartedAtRef.current;
+    if (start == null) return;
+    const tick = () => setSnapshotElapsedSec(Math.floor((Date.now() - start) / 1000));
+    tick();
+    if (!loadingSnap) return;
+    const id = setInterval(tick, 500);
+    return () => clearInterval(id);
+  }, [snapshotProgressOpen, loadingSnap]);
+
   const toggleEnt = useCallback((nombre: string) => {
     setEntSel((prev) => {
       const n = new Set(prev);
@@ -291,6 +314,8 @@ export function ComprasmxPanel() {
     setSnapshotStreamDone(false);
     setSnapshotProgressOpen(true);
     setLoadingSnap(true);
+    snapshotProcessStartedAtRef.current = Date.now();
+    setSnapshotElapsedSec(0);
 
     const ac = new AbortController();
     snapshotAbortRef.current = ac;
@@ -353,9 +378,14 @@ export function ComprasmxPanel() {
             const idx = typeof o.index === "number" ? o.index : undefined;
             const tot = typeof o.total === "number" ? o.total : undefined;
             const id = typeof o.numeroIdentificacion === "string" ? o.numeroIdentificacion : undefined;
+            const docTitle = typeof o.documentoTitulo === "string" ? o.documentoTitulo : undefined;
             let detalle: string | undefined;
             if (idx !== undefined && tot !== undefined) detalle = `${idx} de ${tot}`;
             if (id) detalle = detalle ? `${detalle} · ${id}` : id;
+            if (docTitle) {
+              const short = docTitle.length > 100 ? `${docTitle.slice(0, 97)}…` : docTitle;
+              detalle = detalle ? `${detalle} · ${short}` : short;
+            }
             const line: SnapshotProgressLine = {
               phase,
               message,
@@ -492,6 +522,7 @@ export function ComprasmxPanel() {
           role="dialog"
           aria-modal="true"
           aria-labelledby="snapshot-progress-title"
+          aria-busy={loadingSnap && !snapshotStreamDone}
         >
           <div className="flex max-h-[min(90dvh,720px)] w-full max-w-lg flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-950">
             <div className="shrink-0 border-b border-zinc-200 px-4 py-3 dark:border-zinc-800 sm:px-5">
@@ -513,9 +544,10 @@ export function ComprasmxPanel() {
                     const err = row.phase === "error";
                     const ok = row.phase === "fin";
                     const cancel = row.phase === "cancelado";
+                    const descarga = row.phase === "descarga";
                     return (
                       <li
-                        key={`${row.at}-${i}-${row.phase}`}
+                        key={`${row.at}-${i}-${row.phase}-${row.detalle ?? row.message}`}
                         className={`rounded-lg border px-3 py-2 text-sm ${
                           err
                             ? "border-red-200 bg-red-50 text-red-900 dark:border-red-900 dark:bg-red-950/40 dark:text-red-100"
@@ -523,7 +555,9 @@ export function ComprasmxPanel() {
                               ? "border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-100"
                               : cancel
                                 ? "border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100"
-                                : "border-zinc-200 bg-zinc-50 text-zinc-800 dark:border-zinc-700 dark:bg-zinc-900/50 dark:text-zinc-200"
+                                : descarga
+                                  ? "border-sky-200 bg-sky-50 text-sky-950 dark:border-sky-800 dark:bg-sky-950/35 dark:text-sky-100"
+                                  : "border-zinc-200 bg-zinc-50 text-zinc-800 dark:border-zinc-700 dark:bg-zinc-900/50 dark:text-zinc-200"
                         }`}
                       >
                         <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5">
@@ -542,6 +576,45 @@ export function ComprasmxPanel() {
                   <div ref={snapshotProgressEndRef} />
                 </ol>
               )}
+            </div>
+            <div className="shrink-0 space-y-3 border-t border-zinc-200 bg-zinc-50/90 px-3 py-3 dark:border-zinc-800 dark:bg-zinc-900/50 sm:px-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Tiempo transcurrido</span>
+                <span
+                  className="font-mono text-sm font-semibold tabular-nums text-zinc-900 dark:text-zinc-100"
+                  aria-live="polite"
+                  aria-label={`Tiempo transcurrido: ${formatoDuracionSegundos(snapshotElapsedSec)}`}
+                >
+                  {formatoDuracionSegundos(snapshotElapsedSec)}
+                </span>
+              </div>
+              {loadingSnap && !snapshotStreamDone ? (
+                <div className="space-y-2">
+                  <div
+                    className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800"
+                    role="progressbar"
+                    aria-valuetext="En progreso"
+                  >
+                    <div className="comprasmx-indeterminate-bar h-full rounded-full bg-gradient-to-r from-emerald-700 via-emerald-400 to-emerald-600 dark:from-emerald-500 dark:via-emerald-300 dark:to-emerald-500" />
+                  </div>
+                  <p className="flex items-center gap-2 text-xs font-medium text-emerald-800 dark:text-emerald-300">
+                    <span className="inline-flex items-center gap-0.5" aria-hidden>
+                      <span className="inline-block size-1.5 animate-bounce rounded-full bg-emerald-600 [animation-delay:-0.25s] dark:bg-emerald-400" />
+                      <span className="inline-block size-1.5 animate-bounce rounded-full bg-emerald-600 [animation-delay:-0.12s] dark:bg-emerald-400" />
+                      <span className="inline-block size-1.5 animate-bounce rounded-full bg-emerald-600 dark:bg-emerald-400" />
+                    </span>
+                    Obteniendo datos del portal…
+                  </p>
+                </div>
+              ) : snapshotStreamDone ? (
+                <p className="text-[11px] text-zinc-600 dark:text-zinc-400">
+                  Proceso terminado en{" "}
+                  <span className="font-mono font-medium text-zinc-800 dark:text-zinc-200">
+                    {formatoDuracionSegundos(snapshotElapsedSec)}
+                  </span>
+                  .
+                </p>
+              ) : null}
             </div>
             <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-zinc-200 px-3 py-3 dark:border-zinc-800 sm:px-4">
               {loadingSnap ? (
@@ -648,7 +721,7 @@ export function ComprasmxPanel() {
                     className="size-4 rounded border-zinc-400"
                   />
                   <label htmlFor={`ent-${e}`} className="cursor-pointer select-none text-zinc-800 dark:text-zinc-200">
-                    {e}
+                    {etiquetaEntidadFederativa(e)}
                   </label>
                 </li>
               ))}

@@ -58,7 +58,16 @@ export const ENTIDADES_TODAS_FALLBACK = [
   "TABASCO",
   "TAMAULIPAS",
   "TLAXCALA",
-  "VERACRUZ DE IGNACIO DE LA LLAVE",
+  "VERACRUZ",
   "YUCATÁN",
   "ZACATECAS",
 ] as const;
+
+/** Etiqueta en pantalla; el valor canónico (p. ej. en el body del API) es la clave. */
+const ETIQUETA_ENTIDAD_UI: Readonly<Record<string, string>> = {
+  VERACRUZ: "VERACRUZ",
+};
+
+export function etiquetaEntidadFederativa(nombreOficial: string): string {
+  return ETIQUETA_ENTIDAD_UI[nombreOficial] ?? nombreOficial;
+}

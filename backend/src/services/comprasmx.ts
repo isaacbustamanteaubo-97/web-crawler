@@ -68,7 +68,7 @@ export const ENTIDADES_FEDERATIVAS_TODAS = [
   "TABASCO",
   "TAMAULIPAS",
   "TLAXCALA",
-  "VERACRUZ DE IGNACIO DE LA LLAVE",
+  "VERACRUZ",
   "YUCATÁN",
   "ZACATECAS",
 ] as const;
@@ -94,7 +94,7 @@ function mapEntidadesCanon(): Map<string, string> {
     ["michoacan", "MICHOACÁN DE OCAMPO"],
     ["michoacan de ocampo", "MICHOACÁN DE OCAMPO"],
     ["coahuila", "COAHUILA DE ZARAGOZA"],
-    ["veracruz", "VERACRUZ DE IGNACIO DE LA LLAVE"],
+    ["veracruz de ignacio de la llave", "VERACRUZ"],
     ["queretaro", "QUERÉTARO"],
     ["san luis potosi", "SAN LUIS POTOSÍ"],
     ["nuevo leon", "NUEVO LEÓN"],
@@ -527,10 +527,30 @@ async function leerValoresFechaPublicacionDom(page: Page): Promise<{ desde: stri
   };
 }
 
+/**
+ * Texto que puede mostrar el multiselect del portal para una entidad canónica del API.
+ * Se envían todas las variantes al script del DOM para que coincida aunque el sitio use el nombre largo.
+ */
+const ENTIDAD_VARIANTES_DOM: Readonly<Record<string, readonly string[]>> = {
+  VERACRUZ: ["VERACRUZ", "VERACRUZ DE IGNACIO DE LA LLAVE"],
+};
+
 /** Marca varias entidades en un solo tick (evita N round-trips de Playwright). */
 async function marcarEntidadesMultiselectEnDom(page: Page, entidades: string[]): Promise<void> {
   const list = entidades.map((e) => e.trim()).filter(Boolean);
   if (list.length === 0) return;
+  const expanded: string[] = [];
+  const seenNorm = new Set<string>();
+  for (const e of list) {
+    const variants = ENTIDAD_VARIANTES_DOM[e] ?? [e];
+    for (const v of variants) {
+      const n = normEntidadNombre(v);
+      if (!seenNorm.has(n)) {
+        seenNorm.add(n);
+        expanded.push(v);
+      }
+    }
+  }
   await page.evaluate(
     `(function(names){
       function norm(s){return (s||"").replace(/\\s+/g," ").trim().toLowerCase().normalize("NFD").replace(/[\\u0300-\\u036f]/g,"");}
@@ -543,7 +563,7 @@ async function marcarEntidadesMultiselectEnDom(page: Page, entidades: string[]):
         var t = norm(el.textContent||"");
         if (set[t]) el.click();
       }
-    })(${JSON.stringify(list)})`,
+    })(${JSON.stringify(expanded)})`,
   );
 }
 
@@ -1021,7 +1041,11 @@ async function guardarArchivoTrasClicDescarga(
   return dest;
 }
 
-async function descargarAnexosPorIconosDescargar(page: Page, expedienteListadoId: string): Promise<ComprasmxAnexo[]> {
+async function descargarAnexosPorIconosDescargar(
+  page: Page,
+  expedienteListadoId: string,
+  emit?: (ev: ComprasmxSnapshotProgressEvent) => void,
+): Promise<ComprasmxAnexo[]> {
   if (process.env.COMPRASMX_SKIP_ANEXO_DOWNLOAD === "1") return [];
   const rawMax = parseInt(process.env.COMPRASMX_ANEXOS_MAX ?? "25", 10);
   const max = Math.min(100, Math.max(1, Number.isFinite(rawMax) ? rawMax : 25));
@@ -1042,6 +1066,14 @@ async function descargarAnexosPorIconosDescargar(page: Page, expedienteListadoId
 
   const iconCount = await locatorIconosDescargaAnexos(widget).count();
   if (iconCount === 0) return [];
+
+  const capped = Math.min(iconCount, max);
+  emit?.({
+    phase: "descarga",
+    message: `Iniciando descarga de anexos (hasta ${capped} archivo(s)).`,
+    total: capped,
+    numeroIdentificacion: expedienteListadoId,
+  });
 
   const out: ComprasmxAnexo[] = [];
   const baseDir = baseDirAnexosComprasmx();
@@ -1069,12 +1101,29 @@ async function descargarAnexosPorIconosDescargar(page: Page, expedienteListadoId
       [tipo, desc].filter(Boolean).join(" — ").slice(0, 240) ||
       (num ? `Anexo ${num}` : `Anexo ${saved + 1}`);
 
+    emit?.({
+      phase: "descarga",
+      message: `Descargando anexo ${i + 1} de ${iconCount}…`,
+      index: i + 1,
+      total: iconCount,
+      numeroIdentificacion: expedienteListadoId,
+      documentoTitulo: titulo,
+    });
+
     const prefix = String(saved + 1).padStart(2, "0");
     const dest = await guardarArchivoTrasClicDescarga(page, clickTarget, sessionDir, prefix, perFileMs);
     if (dest) {
       out.push({ titulo, archivoLocal: dest });
       saved += 1;
     }
+  }
+
+  if (saved > 0) {
+    emit?.({
+      phase: "descarga",
+      message: `Anexos guardados en disco: ${saved} archivo(s).`,
+      numeroIdentificacion: expedienteListadoId,
+    });
   }
 
   return out;
@@ -1409,6 +1458,7 @@ const EXTRACT_PROCEDIMIENTO_UI_SCRIPT = `(() => {
 async function extraerDetalleProcedimientoDesdePage(
   page: Page,
   expedienteListadoId?: string,
+  onProgress?: (ev: ComprasmxSnapshotProgressEvent) => void,
 ): Promise<ComprasmxDetalleProcedimiento> {
   try {
     await page.locator(".layout-main, main, app-root").first().waitFor({ state: "visible", timeout: 20_000 }).catch(() => {});
@@ -1416,7 +1466,7 @@ async function extraerDetalleProcedimientoDesdePage(
     await delay(fastMode() ? 80 : 160);
     await prepararSeccionAnexosVisible(page);
     const id = expedienteListadoId?.trim() ?? "";
-    const anexosDescargados = id ? await descargarAnexosPorIconosDescargar(page, id) : [];
+    const anexosDescargados = id ? await descargarAnexosPorIconosDescargar(page, id, onProgress) : [];
     const raw = (await page.evaluate(EXTRACT_PROCEDIMIENTO_UI_SCRIPT)) as RawDetalleProcedimiento;
     const anexosLinks: ComprasmxAnexo[] = Array.isArray(raw?.anexos)
       ? raw.anexos.map((a) => ({ titulo: a.titulo, urlDescarga: a.urlDescarga }))
@@ -1464,11 +1514,14 @@ export type ComprasmxSnapshotProgressEvent = {
     | "resultados"
     | "coincidencias"
     | "detalle"
+    | "descarga"
     | "fin";
   message: string;
   index?: number;
   total?: number;
   numeroIdentificacion?: string;
+  /** Título o descripción del anexo que se está descargando (tabla ANEXOS). */
+  documentoTitulo?: string;
 };
 
 export type FetchComprasmxOptions = {
@@ -1793,7 +1846,9 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
           popupTimeoutMs,
           detMs,
         );
-        const det = await extraerDetalleProcedimientoDesdePage(detailPage, row.numeroIdentificacion);
+        const det = await extraerDetalleProcedimientoDesdePage(detailPage, row.numeroIdentificacion, (ev) =>
+          avance(opts, ev),
+        );
         enriched.push({ ...row, detalleProcedimiento: det });
         await cerrarDetalleYLiberarListado(page, detailPage, mode);
       } catch (e) {

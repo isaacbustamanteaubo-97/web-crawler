@@ -24,3 +24,18 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+@keyframes comprasmx-indeterminate-bar {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(280%);
+  }
+}
+
+.comprasmx-indeterminate-bar {
+  width: 38%;
+  animation: comprasmx-indeterminate-bar 1.35s ease-in-out infinite;
+  will-change: transform;
+}
