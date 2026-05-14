@@ -1,3 +1,4 @@
+import fs from "node:fs/promises";
 import path from "node:path";
 import { type NextFunction, type Request, type Response, Router } from "express";
 import {
@@ -9,6 +10,24 @@ import {
   parseFechaFiltradoDdMmYyyy,
   resolverDocumentoLocalComprasmx,
 } from "../services/comprasmx.js";
+import {
+  esNombreArchivoConvertibleVistaPdf,
+  resolverPdfVistaPrevia,
+} from "../services/officePdfPreview.js";
+
+function extArchivoLower(nombre: string): string {
+  const base = path.basename(nombre.trim());
+  const i = base.lastIndexOf(".");
+  return i >= 0 ? base.slice(i + 1).toLowerCase() : "";
+}
+
+function esAbortoClienteSendfile(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as NodeJS.ErrnoException & { message?: string };
+  if (e.code === "ECONNABORTED") return true;
+  const m = typeof e.message === "string" ? e.message : "";
+  return /aborted/i.test(m);
+}
 
 export const comprasmxRouter = Router();
 
@@ -88,12 +107,25 @@ comprasmxRouter.get("/documentos", async (req: Request, res: Response, next: Nex
     const data = await listarDocumentosLocalesComprasmx(id);
     const qs = (nombre: string) =>
       `${req.baseUrl}/documentos/archivo?${new URLSearchParams({ numeroIdentificacion: data.numeroIdentificacion, nombre }).toString()}`;
+    const qsVistaPdf = (nombre: string) =>
+      `${req.baseUrl}/documentos/archivo?${new URLSearchParams({
+        numeroIdentificacion: data.numeroIdentificacion,
+        nombre,
+        vista: "pdf",
+      }).toString()}`;
     res.json({
       ...data,
-      documentos: data.documentos.map((d) => ({
-        ...d,
-        urlDescarga: qs(d.nombre),
-      })),
+      documentos: data.documentos.map((d) => {
+        const nombreLower = d.nombre.trim().toLowerCase();
+        const esPdf = nombreLower.endsWith(".pdf");
+        const urlVistaPdf =
+          esNombreArchivoConvertibleVistaPdf(d.nombre) || esPdf ? qsVistaPdf(d.nombre) : undefined;
+        return {
+          ...d,
+          urlDescarga: qs(d.nombre),
+          ...(urlVistaPdf ? { urlVistaPdf } : {}),
+        };
+      }),
     });
   } catch (err) {
     next(err);
@@ -103,6 +135,8 @@ comprasmxRouter.get("/documentos", async (req: Request, res: Response, next: Nex
 /**
  * Sirve un archivo de la carpeta del expediente. Queries: `numeroIdentificacion`, `nombre` (nombre exacto en disco).
  * Opcional: `disposition=attachment` para forzar descarga.
+ * Opcional: `vista=pdf` — PDF nativo se envía igual sin conversión; Word/Excel/PowerPoint y similares se convierten
+ * a PDF con LibreOffice (`soffice`) solo en esa petición (caché en disco). Requiere LibreOffice en el servidor.
  */
 comprasmxRouter.get("/documentos/archivo", async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -121,11 +155,55 @@ comprasmxRouter.get("/documentos/archivo", async (req: Request, res: Response, n
       return;
     }
     const attachment = firstQueryString(req.query.disposition)?.toLowerCase() === "attachment";
+    const vistaPdf = firstQueryString(req.query.vista)?.toLowerCase() === "pdf";
+
+    /** Vista PDF en navegador: PDF nativo se sirve tal cual; el resto (Office, etc.) pasa por LibreOffice solo aquí. */
+    if (vistaPdf) {
+      const ext = extArchivoLower(nombre);
+      if (ext === "pdf") {
+        const base = path.basename(meta.absolutePath);
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", `${attachment ? "attachment" : "inline"}; filename="${base.replace(/"/g, "")}"`);
+        res.sendFile(meta.absolutePath, (err) => {
+          if (err && !esAbortoClienteSendfile(err) && !res.headersSent) next(err);
+        });
+        return;
+      }
+      if (!esNombreArchivoConvertibleVistaPdf(nombre)) {
+        res.status(400).json({
+          error:
+            "vista=pdf solo convierte formatos Office u hoja de cálculo admitidos. Los PDF se sirven sin vista=pdf (o con vista=pdf se reenvía el mismo archivo sin conversión).",
+        });
+        return;
+      }
+      try {
+        const pdfAbs = await resolverPdfVistaPrevia(meta.absolutePath);
+        const stem = path.basename(nombre, path.extname(nombre));
+        const fname = `${stem}.pdf`.replace(/"/g, "");
+        const buf = await fs.readFile(pdfAbs);
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", `${attachment ? "attachment" : "inline"}; filename="${fname}"`);
+        res.setHeader("Content-Length", String(buf.length));
+        res.send(buf);
+        return;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const code = msg.includes("ENOENT") || msg.toLowerCase().includes("spawn") ? 503 : 500;
+        res.status(code).json({
+          error:
+            code === 503
+              ? "No se pudo ejecutar LibreOffice (`soffice`). Instálalo o define LIBREOFFICE_SOFFICE con la ruta al binario."
+              : msg,
+        });
+        return;
+      }
+    }
+
     const base = path.basename(meta.absolutePath);
     res.setHeader("Content-Type", meta.mime);
     res.setHeader("Content-Disposition", `${attachment ? "attachment" : "inline"}; filename="${base.replace(/"/g, "")}"`);
     res.sendFile(meta.absolutePath, (err) => {
-      if (err && !res.headersSent) next(err);
+      if (err && !esAbortoClienteSendfile(err) && !res.headersSent) next(err);
     });
   } catch (err) {
     next(err);
