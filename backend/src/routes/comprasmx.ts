@@ -9,6 +9,7 @@ import {
   parseEntidadesFederativasCliente,
   parseFechaFiltradoDdMmYyyy,
   resolverDocumentoLocalComprasmx,
+  type FetchComprasmxOptions,
 } from "../services/comprasmx.js";
 import {
   esNombreArchivoConvertibleVistaPdf,
@@ -27,6 +28,73 @@ function esAbortoClienteSendfile(err: unknown): boolean {
   if (e.code === "ECONNABORTED") return true;
   const m = typeof e.message === "string" ? e.message : "";
   return /aborted/i.test(m);
+}
+
+type ParseSnapshotResult =
+  | { ok: true; fetchOpts: FetchComprasmxOptions }
+  | { ok: false; status: number; body: { error: string } };
+
+function parseSnapshotFetchOptions(req: Request): ParseSnapshotResult {
+  const headedExplicit = parseHeadedQuery(req.query.headed);
+
+  const fechas = parseFechasFromRequest(req);
+  if (fechaIsoSource(req) && !fechas) {
+    return { ok: false, status: 400, body: { error: "fechaISO inválida. Usa YYYY-MM-DD en el body o query, ej. 2026-05-08" } };
+  }
+  if ((firstBodyString(req, "fecha") ?? firstQueryString(req.query.fecha)) && !fechas) {
+    return { ok: false, status: 400, body: { error: "fecha inválida. Usa DD/MM/AAAA en el body o query, ej. 08/05/2026" } };
+  }
+  if (
+    (firstBodyString(req, "fechaDesde") ||
+      firstBodyString(req, "fechaHasta") ||
+      firstQueryString(req.query.fechaDesde) ||
+      firstQueryString(req.query.fechaHasta)) &&
+    !fechas
+  ) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error:
+          "Usa ambos 'fechaDesde' y 'fechaHasta' en DD/MM/AAAA, o un solo 'fecha' / 'fechaISO' para el mismo día.",
+      },
+    };
+  }
+
+  const body = requestBodyRecord(req);
+
+  const entidadesInBody = Object.prototype.hasOwnProperty.call(body, "entidadesFederativas");
+  const entidadesParsed = parseEntidadesFederativasCliente(
+    entidadesInBody ? body["entidadesFederativas"] : undefined,
+  );
+  if (entidadesParsed.error) {
+    return { ok: false, status: 400, body: { error: entidadesParsed.error } };
+  }
+
+  const palabrasClaveRaw = body["palabrasClave"];
+  let palabrasClave: string[] | undefined;
+  if (palabrasClaveRaw !== undefined) {
+    if (!Array.isArray(palabrasClaveRaw) || palabrasClaveRaw.some((p) => typeof p !== "string")) {
+      return {
+        ok: false,
+        status: 400,
+        body: { error: 'palabrasClave debe ser un arreglo de cadenas, ej. ["mantenimiento", "limpieza"]' },
+      };
+    }
+    palabrasClave = (palabrasClaveRaw as string[]).map((p) => p.trim()).filter(Boolean);
+    if (palabrasClave.length === 0) {
+      return { ok: false, status: 400, body: { error: "Si envías palabrasClave, incluye al menos una cadena no vacía." } };
+    }
+  }
+
+  const fetchOpts: FetchComprasmxOptions = {
+    ...(headedExplicit !== undefined ? { headed: headedExplicit } : {}),
+    ...(fechas ? { fechaPublicacionDesde: fechas.desde, fechaPublicacionHasta: fechas.hasta } : {}),
+    ...(entidadesParsed.values ? { entidadesFederativas: entidadesParsed.values } : {}),
+    ...(palabrasClave ? { palabrasClave } : {}),
+  };
+
+  return { ok: true, fetchOpts };
 }
 
 export const comprasmxRouter = Router();
@@ -212,66 +280,56 @@ comprasmxRouter.get("/documentos/archivo", async (req: Request, res: Response, n
 
 comprasmxRouter.post("/snapshot", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const headedExplicit = parseHeadedQuery(req.query.headed);
-
-    const fechas = parseFechasFromRequest(req);
-    if (fechaIsoSource(req) && !fechas) {
-      res.status(400).json({ error: "fechaISO inválida. Usa YYYY-MM-DD en el body o query, ej. 2026-05-08" });
+    const parsed = parseSnapshotFetchOptions(req);
+    if (!parsed.ok) {
+      res.status(parsed.status).json(parsed.body);
       return;
     }
-    if ((firstBodyString(req, "fecha") ?? firstQueryString(req.query.fecha)) && !fechas) {
-      res.status(400).json({
-        error: "fecha inválida. Usa DD/MM/AAAA en el body o query, ej. 08/05/2026",
-      });
-      return;
-    }
-    if (
-      (firstBodyString(req, "fechaDesde") ||
-        firstBodyString(req, "fechaHasta") ||
-        firstQueryString(req.query.fechaDesde) ||
-        firstQueryString(req.query.fechaHasta)) &&
-      !fechas
-    ) {
-      res.status(400).json({
-        error:
-          "Usa ambos 'fechaDesde' y 'fechaHasta' en DD/MM/AAAA, o un solo 'fecha' / 'fechaISO' para el mismo día.",
-      });
-      return;
-    }
-
-    const body = requestBodyRecord(req);
-
-    const entidadesInBody = Object.prototype.hasOwnProperty.call(body, "entidadesFederativas");
-    const entidadesParsed = parseEntidadesFederativasCliente(
-      entidadesInBody ? body["entidadesFederativas"] : undefined,
-    );
-    if (entidadesParsed.error) {
-      res.status(400).json({ error: entidadesParsed.error });
-      return;
-    }
-
-    const palabrasClaveRaw = body["palabrasClave"];
-    let palabrasClave: string[] | undefined;
-    if (palabrasClaveRaw !== undefined) {
-      if (!Array.isArray(palabrasClaveRaw) || palabrasClaveRaw.some((p) => typeof p !== "string")) {
-        res.status(400).json({ error: "palabrasClave debe ser un arreglo de cadenas, ej. [\"mantenimiento\", \"limpieza\"]" });
-        return;
-      }
-      palabrasClave = (palabrasClaveRaw as string[]).map((p) => p.trim()).filter(Boolean);
-      if (palabrasClave.length === 0) {
-        res.status(400).json({ error: "Si envías palabrasClave, incluye al menos una cadena no vacía." });
-        return;
-      }
-    }
-
-    const data = await fetchComprasmxSnapshot({
-      ...(headedExplicit !== undefined ? { headed: headedExplicit } : {}),
-      ...(fechas ? { fechaPublicacionDesde: fechas.desde, fechaPublicacionHasta: fechas.hasta } : {}),
-      ...(entidadesParsed.values ? { entidadesFederativas: entidadesParsed.values } : {}),
-      ...(palabrasClave ? { palabrasClave } : {}),
-    });
+    const data = await fetchComprasmxSnapshot(parsed.fetchOpts);
     res.json(data);
   } catch (err) {
     next(err);
+  }
+});
+
+/**
+ * Igual que POST /snapshot pero responde con **NDJSON** (una línea JSON por evento):
+ * `{"type":"progress",...}` avances; al terminar `{"type":"done","payload":{...}}` o `{"type":"error","message":"..."}`.
+ * Útil para mostrar progreso en el cliente sin WebSockets.
+ */
+comprasmxRouter.post("/snapshot/stream", async (req: Request, res: Response, next: NextFunction) => {
+  const parsed = parseSnapshotFetchOptions(req);
+  if (!parsed.ok) {
+    res.status(parsed.status).json(parsed.body);
+    return;
+  }
+
+  res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  const resFlush = res as Response & { flushHeaders?: () => void };
+  if (typeof resFlush.flushHeaders === "function") resFlush.flushHeaders();
+
+  const writeNdjson = (obj: object) => {
+    if (res.writableEnded) return;
+    res.write(`${JSON.stringify(obj)}\n`);
+  };
+
+  try {
+    const data = await fetchComprasmxSnapshot({
+      ...parsed.fetchOpts,
+      onProgress: (ev) => writeNdjson({ type: "progress", ...ev }),
+    });
+    writeNdjson({ type: "done", payload: data });
+    res.end();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!res.writableEnded) {
+      writeNdjson({ type: "error", message: msg });
+      res.end();
+    } else {
+      next(e);
+    }
   }
 });

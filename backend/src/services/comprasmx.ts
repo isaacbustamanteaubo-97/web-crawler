@@ -1452,6 +1452,25 @@ async function extraerDetalleProcedimientoDesdePage(
   }
 }
 
+export type ComprasmxSnapshotProgressEvent = {
+  phase:
+    | "inicio"
+    | "navegador"
+    | "contexto"
+    | "portal"
+    | "filtros_panel"
+    | "filtros_formulario"
+    | "buscar"
+    | "resultados"
+    | "coincidencias"
+    | "detalle"
+    | "fin";
+  message: string;
+  index?: number;
+  total?: number;
+  numeroIdentificacion?: string;
+};
+
 export type FetchComprasmxOptions = {
   /**
    * `true`/`false`: forzar modo con o sin ventana.
@@ -1472,6 +1491,8 @@ export type FetchComprasmxOptions = {
    * Por cada una (hasta el límite) se hace clic en el expediente en el listado, se lee el detalle en la pestaña nueva o en la misma ventana, y se vuelve al listado.
    */
   palabrasClave?: string[];
+  /** Avance del crawler (p. ej. para streaming NDJSON). No debe lanzar excepciones. */
+  onProgress?: (ev: ComprasmxSnapshotProgressEvent) => void;
 };
 
 /** Reutiliza Chromium entre peticiones (mismo modo headed/headless). Ahorra varios segundos por request. */
@@ -1603,6 +1624,14 @@ export async function fetchComprasmxSnapshot(opts?: FetchComprasmxOptions): Prom
   return run;
 }
 
+function avance(opts: FetchComprasmxOptions | undefined, ev: ComprasmxSnapshotProgressEvent): void {
+  try {
+    opts?.onProgress?.(ev);
+  } catch {
+    /* callback no debe tumbar el crawler */
+  }
+}
+
 async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<ComprasmxSnapshot> {
   const fechaDesde = opts?.fechaPublicacionDesde ?? fechaHoyDdMmYyyy();
   const fechaHasta = opts?.fechaPublicacionHasta ?? fechaDesde;
@@ -1618,6 +1647,7 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
   let disposableBrowser: Browser | undefined;
 
   try {
+    avance(opts, { phase: "inicio", message: "Iniciando consulta en Compras MX…" });
     ensureBrowserShutdownHooks();
     const { width, height } = resolveViewportSize();
     let browser: Browser;
@@ -1631,6 +1661,11 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
       browser = disposableBrowser;
     }
 
+    avance(opts, {
+      phase: "navegador",
+      message: headed ? "Chromium en marcha (ventana visible)." : "Chromium en marcha (modo headless).",
+    });
+
     browserContext = await browser.newContext({
       acceptDownloads: true,
       locale: "es-MX",
@@ -1638,6 +1673,8 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
       viewport: { width, height },
     });
     page = await browserContext.newPage();
+
+    avance(opts, { phase: "contexto", message: "Página nueva creada; aplicando optimizaciones de red." });
 
     await instalarBloqueoRecursosLigeros(page);
 
@@ -1647,7 +1684,11 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
 
     await navegarSitioPublicoComprasmx(page, navTimeoutMs);
 
+    avance(opts, { phase: "portal", message: "Portal Compras MX cargado." });
+
     await abrirPanelFiltros(page);
+
+    avance(opts, { phase: "filtros_panel", message: "Panel de filtros abierto; limpiando y configurando vista." });
 
     await scrollPanelFiltrosAlInicio(page);
 
@@ -1670,11 +1711,21 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
 
     await cerrarOverlayMultiselect(page, multiselect);
 
+    avance(opts, {
+      phase: "filtros_formulario",
+      message: `Filtros listos (${entidades.length} entidad(es)); ejecutando búsqueda en el portal…`,
+    });
+
     // Antes del click guardamos el total para poder detectar si la SPA todavía está mostrando el estado anterior.
     const totalPieAntesBusqueda = await leerTotalPiePortal(page);
     await clickBuscar(page, navTimeoutMs);
 
     const { totalPie, sinResultados } = await esperarRespuestaBusqueda(page, navTimeoutMs, totalPieAntesBusqueda);
+
+    avance(opts, {
+      phase: "buscar",
+      message: sinResultados ? "Búsqueda finalizada: sin resultados." : "Búsqueda finalizada; leyendo filas del listado.",
+    });
 
     const filas = await extraerFilasConReintentos(page, totalPie, sinResultados);
 
@@ -1688,7 +1739,16 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
     const palabrasRespuesta = (opts?.palabrasClave ?? []).map((k) => k.trim()).filter(Boolean);
     const kws = palabrasRespuesta.map((k) => k.toLowerCase());
 
+    avance(opts, {
+      phase: "resultados",
+      message:
+        kws.length === 0
+          ? `Listado obtenido: ${filas.length} fila(s) visibles.`
+          : `Listado obtenido: ${filas.length} fila(s); filtrando por ${palabrasRespuesta.length} palabra(s) clave…`,
+    });
+
     if (kws.length === 0) {
+      avance(opts, { phase: "fin", message: "Consulta completada." });
       return {
         source: SOURCE_URL,
         fetchedAt: new Date().toISOString(),
@@ -1708,11 +1768,24 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
     const omitidos = Math.max(0, coincidencias.length - lim);
     const procesar = coincidencias.slice(0, lim);
 
+    avance(opts, {
+      phase: "coincidencias",
+      message: `${coincidencias.length} fila(s) coinciden con las palabras clave; se procesarán ${procesar.length} expediente(s)${omitidos ? ` (${omitidos} omitidos por límite).` : "."}`,
+    });
+
     const detMs = Number(process.env.COMPRASMX_PROCEDIMIENTO_TIMEOUT_MS) || 60_000;
     const popupTimeoutMs = Number(process.env.COMPRASMX_PROCEDIMIENTO_POPUP_TIMEOUT_MS) || 15_000;
 
     const enriched: ComprasmxFila[] = [];
-    for (const row of procesar) {
+    for (let i = 0; i < procesar.length; i++) {
+      const row = procesar[i]!;
+      avance(opts, {
+        phase: "detalle",
+        message: `Abriendo expediente ${row.numeroIdentificacion} y descargando anexos si aplica…`,
+        index: i + 1,
+        total: procesar.length,
+        numeroIdentificacion: row.numeroIdentificacion,
+      });
       try {
         const { detailPage, mode } = await abrirDetalleProcedimientoDesdeListado(
           page,
@@ -1733,6 +1806,8 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
         });
       }
     }
+
+    avance(opts, { phase: "fin", message: "Consulta completada." });
 
     return {
       source: SOURCE_URL,
