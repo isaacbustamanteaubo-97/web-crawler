@@ -53,6 +53,8 @@ type DocumentoRow = {
 type DocumentosResponse = {
   numeroIdentificacion: string;
   documentos: DocumentoRow[];
+  /** Ruta absoluta del API para GET `/documentos/zip` de este expediente. */
+  urlZip?: string;
   error?: string;
 };
 
@@ -208,6 +210,7 @@ export function ComprasmxPanel() {
   const [pdfLoading, setPdfLoading] = useState(false);
   const [pdfFetchError, setPdfFetchError] = useState<string | null>(null);
   const [downloadingAllDocs, setDownloadingAllDocs] = useState(false);
+  const [docZipHref, setDocZipHref] = useState<string | null>(null);
 
   const [snapshotProgressOpen, setSnapshotProgressOpen] = useState(false);
   const [snapshotProgressLog, setSnapshotProgressLog] = useState<SnapshotProgressLine[]>([]);
@@ -347,6 +350,20 @@ export function ComprasmxPanel() {
     [palabrasTexto],
   );
 
+  const requisitosBusqueda = useMemo(() => {
+    const faltantes: string[] = [];
+    if (!esFechaIsoValida(fechaISO.trim())) {
+      faltantes.push("fecha de publicación válida (YYYY-MM-DD)");
+    }
+    if (entSel.size === 0) {
+      faltantes.push("al menos una entidad federativa");
+    }
+    if (palabrasClavePayload().length === 0) {
+      faltantes.push("al menos una palabra clave");
+    }
+    return { ok: faltantes.length === 0, faltantes };
+  }, [fechaISO, entSel, palabrasClavePayload]);
+
   const ejecutarSnapshot = useCallback(async () => {
     setSnapError(null);
     setSnapshot(null);
@@ -354,16 +371,16 @@ export function ComprasmxPanel() {
 
     const entidadesFederativas = [...entSel].sort((a, b) => a.localeCompare(b, "es"));
     if (entidadesFederativas.length === 0) {
-      setSnapError("Selecciona al menos una entidad federativa.");
+      setSnapError("Selecciona al menos una entidad federativa antes de buscar.");
       return;
     }
-    if (!esFechaIsoValida(fechaISO)) {
-      setSnapError("La fecha debe ser válida en formato YYYY-MM-DD (ej. 2026-05-14).");
+    if (!esFechaIsoValida(fechaISO.trim())) {
+      setSnapError("Indica una fecha de publicación válida (YYYY-MM-DD) antes de buscar.");
       return;
     }
     const palabrasClave = palabrasClavePayload();
     if (palabrasClave.length === 0) {
-      setSnapError("Escribe al menos una palabra clave (una por línea).");
+      setSnapError("Escribe al menos una palabra clave (una por línea) antes de buscar.");
       return;
     }
 
@@ -522,6 +539,7 @@ export function ComprasmxPanel() {
       setDocModal(numeroIdentificacion);
       setDocs([]);
       setDocsError(null);
+      setDocZipHref(null);
       setPreview(null);
       setLoadingDocs(true);
       try {
@@ -531,6 +549,13 @@ export function ComprasmxPanel() {
           setDocsError(j.error ?? `Error ${r.status}`);
           return;
         }
+        const zipHref =
+          typeof j.urlZip === "string"
+            ? proxiedComprasmxUrl(j.urlZip)
+            : proxiedComprasmxUrl(
+                `/comprasmx/documentos/zip?${new URLSearchParams({ numeroIdentificacion }).toString()}`,
+              );
+        setDocZipHref(zipHref);
         setDocs(
           j.documentos.map((d) => ({
             ...d,
@@ -732,7 +757,12 @@ export function ComprasmxPanel() {
               maxLength={10}
               value={fechaISO}
               onChange={(e) => setFechaISO(e.target.value)}
-              className="w-44 rounded-lg border border-zinc-300 bg-white px-3 py-2 font-mono text-sm text-zinc-900 shadow-sm outline-none ring-zinc-400/40 focus:border-emerald-600 focus:ring-2 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100 dark:focus:border-emerald-500"
+              aria-invalid={!esFechaIsoValida(fechaISO.trim())}
+              className={`w-44 rounded-lg border bg-white px-3 py-2 font-mono text-sm text-zinc-900 shadow-sm outline-none ring-zinc-400/40 focus:ring-2 dark:bg-zinc-900 dark:text-zinc-100 ${
+                esFechaIsoValida(fechaISO.trim())
+                  ? "border-zinc-300 focus:border-emerald-600 dark:border-zinc-600 dark:focus:border-emerald-500"
+                  : "border-amber-500 focus:border-amber-600 dark:border-amber-600 dark:focus:border-amber-500"
+              }`}
             />
           </div>
           <button
@@ -775,7 +805,13 @@ export function ComprasmxPanel() {
               </button>
             </div>
           </div>
-          <div className="max-h-56 overflow-y-auto rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
+          <div
+            className={`max-h-56 overflow-y-auto rounded-lg border p-3 dark:border-zinc-800 ${
+              entSel.size > 0 ? "border-zinc-200" : "border-amber-500 dark:border-amber-600"
+            }`}
+            role="group"
+            aria-label="Entidades federativas"
+          >
             <ul className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
               {entidadesLista.map((e) => (
                 <li key={e} className="flex items-center gap-2 text-sm">
@@ -804,7 +840,12 @@ export function ComprasmxPanel() {
             rows={8}
             value={palabrasTexto}
             onChange={(e) => setPalabrasTexto(e.target.value)}
-            className="w-full rounded-lg border border-zinc-300 bg-white p-3 font-mono text-sm dark:border-zinc-700 dark:bg-zinc-900"
+            aria-invalid={palabrasClavePayload().length === 0}
+            className={`w-full rounded-lg border bg-white p-3 font-mono text-sm dark:bg-zinc-900 ${
+              palabrasClavePayload().length > 0
+                ? "border-zinc-300 dark:border-zinc-700"
+                : "border-amber-500 dark:border-amber-600"
+            }`}
           />
         </div>
 
@@ -815,12 +856,24 @@ export function ComprasmxPanel() {
 
         <button
           type="button"
-          disabled={loadingSnap}
+          disabled={loadingSnap || !requisitosBusqueda.ok}
+          title={
+            !requisitosBusqueda.ok && !loadingSnap
+              ? `Falta: ${requisitosBusqueda.faltantes.join("; ")}.`
+              : undefined
+          }
           onClick={() => void ejecutarSnapshot()}
           className="inline-flex items-center justify-center rounded-lg bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-800 disabled:opacity-60"
         >
           {loadingSnap ? "Buscando…" : "Buscar licitaciones (snapshot)"}
         </button>
+
+        {!requisitosBusqueda.ok && !loadingSnap ? (
+          <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">
+            Para buscar necesitas:{" "}
+            <span className="font-medium">{requisitosBusqueda.faltantes.join(" · ")}</span>.
+          </p>
+        ) : null}
 
         {snapError ? (
           <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
@@ -875,13 +928,23 @@ export function ComprasmxPanel() {
                 Documentos — {docModal}
               </h2>
               <div className="flex shrink-0 flex-wrap items-center gap-2">
+                <a
+                  href={docZipHref && docs.length > 0 && !loadingDocs ? docZipHref : undefined}
+                  download
+                  aria-disabled={!docZipHref || docs.length === 0 || loadingDocs}
+                  className={`inline-flex items-center justify-center rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white no-underline hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white ${
+                    !docZipHref || docs.length === 0 || loadingDocs ? "pointer-events-none opacity-50" : ""
+                  }`}
+                >
+                  Descargar ZIP
+                </a>
                 <button
                   type="button"
                   disabled={loadingDocs || docs.length === 0 || downloadingAllDocs}
                   onClick={() => void descargarTodosDocumentos()}
                   className="rounded-lg border border-emerald-600 bg-emerald-50 px-3 py-1.5 text-sm font-medium text-emerald-900 hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-500 dark:bg-emerald-950/50 dark:text-emerald-100 dark:hover:bg-emerald-900/60"
                 >
-                  {downloadingAllDocs ? "Descargando…" : "Descargar todos"}
+                  {downloadingAllDocs ? "Descargando…" : "Descargar todos (sin comprimir)"}
                 </button>
                 <button
                   type="button"
@@ -889,6 +952,7 @@ export function ComprasmxPanel() {
                   onClick={() => {
                     setDocModal(null);
                     setDownloadingAllDocs(false);
+                    setDocZipHref(null);
                     setPreview(null);
                     setPdfBlobUrl((prev) => {
                       if (prev) URL.revokeObjectURL(prev);

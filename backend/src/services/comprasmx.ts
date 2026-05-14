@@ -1544,6 +1544,8 @@ export type FetchComprasmxOptions = {
    * Por cada una (hasta el límite) se hace clic en el expediente en el listado, se lee el detalle en la pestaña nueva o en la misma ventana, y se vuelve al listado.
    */
   palabrasClave?: string[];
+  /** Si el cliente cierra la conexión (p. ej. aborta el fetch), se cierra el contexto de Playwright y se detiene el crawl. */
+  signal?: AbortSignal;
   /** Avance del crawler (p. ej. para streaming NDJSON). No debe lanzar excepciones. */
   onProgress?: (ev: ComprasmxSnapshotProgressEvent) => void;
 };
@@ -1685,6 +1687,21 @@ function avance(opts: FetchComprasmxOptions | undefined, ev: ComprasmxSnapshotPr
   }
 }
 
+export function esCancelacionCliente(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { name?: string; message?: string };
+  if (e.name === "AbortError") return true;
+  const m = typeof e.message === "string" ? e.message : "";
+  return /cancelad|aborted|Target page, context or browser has been closed|Browser has been closed/i.test(m);
+}
+
+function throwIfClienteCancelo(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  const e = new Error("Consulta cancelada por el cliente.");
+  e.name = "AbortError";
+  throw e;
+}
+
 async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<ComprasmxSnapshot> {
   const fechaDesde = opts?.fechaPublicacionDesde ?? fechaHoyDdMmYyyy();
   const fechaHasta = opts?.fechaPublicacionHasta ?? fechaDesde;
@@ -1698,6 +1715,7 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
   let page: Page | undefined;
   let browserContext: BrowserContext | undefined;
   let disposableBrowser: Browser | undefined;
+  let quitarListenerAbortCliente: (() => void) | undefined;
 
   try {
     avance(opts, { phase: "inicio", message: "Iniciando consulta en Compras MX…" });
@@ -1726,6 +1744,23 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
       viewport: { width, height },
     });
     page = await browserContext.newPage();
+
+    const sig = opts?.signal;
+    const cerrarContextoPorCliente = () => {
+      void browserContext?.close().catch(() => {});
+      if (disposableBrowser) void disposableBrowser.close().catch(() => {});
+    };
+    if (sig) {
+      if (sig.aborted) {
+        cerrarContextoPorCliente();
+        throwIfClienteCancelo(sig);
+      }
+      const onAbort = () => {
+        cerrarContextoPorCliente();
+      };
+      sig.addEventListener("abort", onAbort, { once: true });
+      quitarListenerAbortCliente = () => sig.removeEventListener("abort", onAbort);
+    }
 
     avance(opts, { phase: "contexto", message: "Página nueva creada; aplicando optimizaciones de red." });
 
@@ -1831,6 +1866,7 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
 
     const enriched: ComprasmxFila[] = [];
     for (let i = 0; i < procesar.length; i++) {
+      throwIfClienteCancelo(opts?.signal);
       const row = procesar[i]!;
       avance(opts, {
         phase: "detalle",
@@ -1852,6 +1888,7 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
         enriched.push({ ...row, detalleProcedimiento: det });
         await cerrarDetalleYLiberarListado(page, detailPage, mode);
       } catch (e) {
+        if (esCancelacionCliente(e)) throw e;
         enriched.push({
           ...row,
           detalleProcedimiento: {
@@ -1883,6 +1920,7 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
       totalEnPieDePortal: sinResultados ? 0 : totalPie,
     };
   } finally {
+    quitarListenerAbortCliente?.();
     await browserContext?.close().catch(() => {});
     if (disposableBrowser) await disposableBrowser.close().catch(() => {});
   }

@@ -1,8 +1,11 @@
+import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import archiver from "archiver";
 import { type NextFunction, type Request, type Response, Router } from "express";
 import {
   ENTIDADES_FEDERATIVAS_TODAS,
+  esCancelacionCliente,
   fetchComprasmxSnapshot,
   fechaIsoAMexicoDdMmYyyy,
   listarDocumentosLocalesComprasmx,
@@ -61,37 +64,78 @@ function parseSnapshotFetchOptions(req: Request): ParseSnapshotResult {
     };
   }
 
+  if (!fechas) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error:
+          "La búsqueda requiere fecha explícita: envía fechaISO (YYYY-MM-DD) o fecha (DD/MM/AAAA) o fechaDesde y fechaHasta (DD/MM/AAAA) en el body o query.",
+      },
+    };
+  }
+
   const body = requestBodyRecord(req);
 
   const entidadesInBody = Object.prototype.hasOwnProperty.call(body, "entidadesFederativas");
+  if (!entidadesInBody) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error:
+          "El body debe incluir entidadesFederativas: un arreglo no vacío de estados (nombres canónicos, véase GET /comprasmx/entidades).",
+      },
+    };
+  }
   const entidadesParsed = parseEntidadesFederativasCliente(
     entidadesInBody ? body["entidadesFederativas"] : undefined,
   );
   if (entidadesParsed.error) {
     return { ok: false, status: 400, body: { error: entidadesParsed.error } };
   }
+  if (!entidadesParsed.values || entidadesParsed.values.length === 0) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: "entidadesFederativas debe incluir al menos un estado reconocido." },
+    };
+  }
 
+  const palabrasInBody = Object.prototype.hasOwnProperty.call(body, "palabrasClave");
+  if (!palabrasInBody) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error:
+          "El body debe incluir palabrasClave: un arreglo con al menos una cadena no vacía (filtro sobre el nombre de la licitación).",
+      },
+    };
+  }
   const palabrasClaveRaw = body["palabrasClave"];
-  let palabrasClave: string[] | undefined;
-  if (palabrasClaveRaw !== undefined) {
-    if (!Array.isArray(palabrasClaveRaw) || palabrasClaveRaw.some((p) => typeof p !== "string")) {
-      return {
-        ok: false,
-        status: 400,
-        body: { error: 'palabrasClave debe ser un arreglo de cadenas, ej. ["mantenimiento", "limpieza"]' },
-      };
-    }
-    palabrasClave = (palabrasClaveRaw as string[]).map((p) => p.trim()).filter(Boolean);
-    if (palabrasClave.length === 0) {
-      return { ok: false, status: 400, body: { error: "Si envías palabrasClave, incluye al menos una cadena no vacía." } };
-    }
+  if (!Array.isArray(palabrasClaveRaw) || palabrasClaveRaw.some((p) => typeof p !== "string")) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'palabrasClave debe ser un arreglo de cadenas, ej. ["mantenimiento", "limpieza"]' },
+    };
+  }
+  const palabrasClave = (palabrasClaveRaw as string[]).map((p) => p.trim()).filter(Boolean);
+  if (palabrasClave.length === 0) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: "palabrasClave debe contener al menos una palabra o frase no vacía." },
+    };
   }
 
   const fetchOpts: FetchComprasmxOptions = {
     ...(headedExplicit !== undefined ? { headed: headedExplicit } : {}),
-    ...(fechas ? { fechaPublicacionDesde: fechas.desde, fechaPublicacionHasta: fechas.hasta } : {}),
-    ...(entidadesParsed.values ? { entidadesFederativas: entidadesParsed.values } : {}),
-    ...(palabrasClave ? { palabrasClave } : {}),
+    fechaPublicacionDesde: fechas.desde,
+    fechaPublicacionHasta: fechas.hasta,
+    entidadesFederativas: entidadesParsed.values,
+    palabrasClave,
   };
 
   return { ok: true, fetchOpts };
@@ -181,8 +225,10 @@ comprasmxRouter.get("/documentos", async (req: Request, res: Response, next: Nex
         nombre,
         vista: "pdf",
       }).toString()}`;
+    const urlZip = `${req.baseUrl}/documentos/zip?${new URLSearchParams({ numeroIdentificacion: data.numeroIdentificacion }).toString()}`;
     res.json({
       ...data,
+      urlZip,
       documentos: data.documentos.map((d) => {
         const nombreLower = d.nombre.trim().toLowerCase();
         const esPdf = nombreLower.endsWith(".pdf");
@@ -195,6 +241,72 @@ comprasmxRouter.get("/documentos", async (req: Request, res: Response, next: Nex
         };
       }),
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Descarga un solo `.zip` con todos los archivos locales del expediente (misma carpeta que `/documentos`).
+ * Query: `numeroIdentificacion`. Los nombres dentro del ZIP coinciden con los archivos en disco.
+ */
+comprasmxRouter.get("/documentos/zip", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = firstQueryString(req.query.numeroIdentificacion);
+    if (!id) {
+      res.status(400).json({
+        error:
+          "Query obligatorio: numeroIdentificacion. Ej. GET /comprasmx/documentos/zip?numeroIdentificacion=AA-012345678",
+      });
+      return;
+    }
+    const data = await listarDocumentosLocalesComprasmx(id);
+    if (data.total === 0) {
+      res.status(404).json({ error: "No hay archivos locales para este expediente. Ejecuta un snapshot con descarga de anexos primero." });
+      return;
+    }
+
+    const stem = id
+      .replace(/[^\p{L}\p{N}._-]+/gu, "_")
+      .replace(/_+/g, "_")
+      .slice(0, 80);
+    const zipName = `comprasmx-${stem || "expediente"}.zip`.replace(/"/g, "");
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
+
+    const archive = archiver("zip", { zlib: { level: 6 } });
+    const onArchiveErr = (err: Error) => {
+      if (!res.headersSent) next(err);
+      else {
+        try {
+          archive.abort();
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+    archive.on("error", onArchiveErr);
+    archive.pipe(res);
+
+    const onClose = () => {
+      try {
+        archive.abort();
+      } catch {
+        /* ignore */
+      }
+    };
+    req.on("close", onClose);
+    try {
+      for (const d of data.documentos) {
+        const meta = await resolverDocumentoLocalComprasmx(data.numeroIdentificacion, d.nombre);
+        if (!meta) continue;
+        archive.append(createReadStream(meta.absolutePath), { name: d.nombre });
+      }
+      await archive.finalize();
+    } finally {
+      req.off("close", onClose);
+    }
   } catch (err) {
     next(err);
   }
@@ -285,8 +397,18 @@ comprasmxRouter.post("/snapshot", async (req: Request, res: Response, next: Next
       res.status(parsed.status).json(parsed.body);
       return;
     }
-    const data = await fetchComprasmxSnapshot(parsed.fetchOpts);
-    res.json(data);
+    const ac = new AbortController();
+    /** `req` puede emitir `close` al terminar de leer el body; usar `res` y solo abortar si la respuesta no terminó. */
+    const onClientDisconnected = () => {
+      if (!res.writableEnded) ac.abort();
+    };
+    res.on("close", onClientDisconnected);
+    try {
+      const data = await fetchComprasmxSnapshot({ ...parsed.fetchOpts, signal: ac.signal });
+      res.json(data);
+    } finally {
+      res.off("close", onClientDisconnected);
+    }
   } catch (err) {
     next(err);
   }
@@ -316,20 +438,33 @@ comprasmxRouter.post("/snapshot/stream", async (req: Request, res: Response, nex
     res.write(`${JSON.stringify(obj)}\n`);
   };
 
+  const ac = new AbortController();
+  const onClientDisconnected = () => {
+    if (!res.writableEnded) ac.abort();
+  };
+  res.on("close", onClientDisconnected);
+
   try {
     const data = await fetchComprasmxSnapshot({
       ...parsed.fetchOpts,
+      signal: ac.signal,
       onProgress: (ev) => writeNdjson({ type: "progress", ...ev }),
     });
     writeNdjson({ type: "done", payload: data });
     res.end();
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
+    const msg = esCancelacionCliente(e)
+      ? "Consulta cancelada por el cliente."
+      : e instanceof Error
+        ? e.message
+        : String(e);
     if (!res.writableEnded) {
       writeNdjson({ type: "error", message: msg });
       res.end();
     } else {
       next(e);
     }
+  } finally {
+    res.off("close", onClientDisconnected);
   }
 });
