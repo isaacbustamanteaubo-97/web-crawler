@@ -145,6 +145,39 @@ function categoriaVista(nombre: string): "pdf" | "imagen" | "texto" | "otro" {
   return "otro";
 }
 
+function nombreLocalDescargaSeguro(nombre: string): string {
+  const t = nombre.trim() || "documento";
+  return t.replace(/[/\\?*:"<>|]/g, "_").slice(0, 240);
+}
+
+function IndicadorCargaVistaPdf({ conversionEnServidor }: { conversionEnServidor?: boolean }) {
+  return (
+    <div
+      className="flex min-h-[220px] flex-1 flex-col justify-center gap-3 bg-zinc-50/80 px-6 py-10 dark:bg-zinc-900/60"
+      role="status"
+      aria-busy="true"
+      aria-label={conversionEnServidor ? "Convirtiendo documento a PDF en el servidor" : "Cargando vista PDF"}
+    >
+      <div className="mx-auto h-1.5 w-full max-w-md overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-700">
+        <div className="comprasmx-indeterminate-bar h-full rounded-full bg-gradient-to-r from-emerald-700 via-emerald-400 to-emerald-600 dark:from-emerald-500 dark:via-emerald-300 dark:to-emerald-500" />
+      </div>
+      <p className="flex flex-wrap items-center justify-center gap-2 text-center text-sm font-medium text-emerald-800 dark:text-emerald-300">
+        <span className="inline-flex items-center gap-0.5" aria-hidden>
+          <span className="inline-block size-1.5 animate-bounce rounded-full bg-emerald-600 [animation-delay:-0.25s] dark:bg-emerald-400" />
+          <span className="inline-block size-1.5 animate-bounce rounded-full bg-emerald-600 [animation-delay:-0.12s] dark:bg-emerald-400" />
+          <span className="inline-block size-1.5 animate-bounce rounded-full bg-emerald-600 dark:bg-emerald-400" />
+        </span>
+        {conversionEnServidor ? "Convirtiendo a PDF en el servidor…" : "Cargando vista PDF…"}
+      </p>
+      <p className="mx-auto max-w-md text-center text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
+        {conversionEnServidor
+          ? "El backend usa LibreOffice cuando aplica; en documentos grandes puede tardar más de un minuto. No cierres el modal hasta que termine."
+          : "Obteniendo el archivo para mostrarlo aquí."}
+      </p>
+    </div>
+  );
+}
+
 export function ComprasmxPanel() {
   const api = useMemo(() => comprasmxApiBase(), []);
 
@@ -168,10 +201,13 @@ export function ComprasmxPanel() {
     texto?: string;
     /** true = PDF en iframe (archivo .pdf o conversión `vista=pdf` del backend). */
     modoPdf?: boolean;
+    /** Office u hoja vía `vista=pdf`: el servidor puede estar convirtiendo. */
+    conversionEnServidor?: boolean;
   } | null>(null);
   const [pdfBlobUrl, setPdfBlobUrl] = useState<string | null>(null);
   const [pdfLoading, setPdfLoading] = useState(false);
   const [pdfFetchError, setPdfFetchError] = useState<string | null>(null);
+  const [downloadingAllDocs, setDownloadingAllDocs] = useState(false);
 
   const [snapshotProgressOpen, setSnapshotProgressOpen] = useState(false);
   const [snapshotProgressLog, setSnapshotProgressLog] = useState<SnapshotProgressLine[]>([]);
@@ -248,6 +284,34 @@ export function ComprasmxPanel() {
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [preview?.modoPdf, preview?.url]);
+
+  const descargarTodosDocumentos = useCallback(async () => {
+    if (docs.length === 0) return;
+    setDownloadingAllDocs(true);
+    try {
+      for (const d of docs) {
+        try {
+          const r = await fetch(d.urlDescarga);
+          if (!r.ok) continue;
+          const blob = await r.blob();
+          const u = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = u;
+          a.download = nombreLocalDescargaSeguro(d.nombre);
+          a.rel = "noopener";
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(u);
+          await new Promise((res) => setTimeout(res, 450));
+        } catch {
+          /* continuar con el siguiente */
+        }
+      }
+    } finally {
+      setDownloadingAllDocs(false);
+    }
+  }, [docs]);
 
   useEffect(() => {
     if (!snapshotProgressOpen || snapshotProgressLog.length === 0) return;
@@ -502,7 +566,9 @@ export function ComprasmxPanel() {
         return;
       }
       if (cat === "pdf" || d.urlVistaPdf) {
-        setPreview({ nombre: d.nombre, url: d.urlVistaPdf ?? d.urlDescarga, modoPdf: true });
+        const url = d.urlVistaPdf ?? d.urlDescarga;
+        const conversionEnServidor = Boolean(d.urlVistaPdf && cat !== "pdf");
+        setPreview({ nombre: d.nombre, url, modoPdf: true, conversionEnServidor });
         return;
       }
       if (cat === "imagen") {
@@ -804,26 +870,37 @@ export function ComprasmxPanel() {
           aria-labelledby="doc-modal-title"
         >
           <div className="flex h-[min(96vh,calc(100dvh-1rem))] w-[min(100vw-1rem,1680px)] max-w-[1680px] flex-col overflow-hidden rounded-xl bg-white shadow-2xl dark:bg-zinc-950">
-            <div className="flex shrink-0 items-center justify-between border-b border-zinc-200 px-4 py-3 dark:border-zinc-800 sm:px-5">
-              <h2 id="doc-modal-title" className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
+            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-zinc-200 px-4 py-3 dark:border-zinc-800 sm:px-5">
+              <h2 id="doc-modal-title" className="min-w-0 flex-1 truncate text-lg font-semibold text-zinc-900 dark:text-zinc-50">
                 Documentos — {docModal}
               </h2>
-              <button
-                type="button"
-                className="rounded-lg px-3 py-1.5 text-sm text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-900"
-                onClick={() => {
-                  setDocModal(null);
-                  setPreview(null);
-                  setPdfBlobUrl((prev) => {
-                    if (prev) URL.revokeObjectURL(prev);
-                    return null;
-                  });
-                  setPdfFetchError(null);
-                  setPdfLoading(false);
-                }}
-              >
-                Cerrar
-              </button>
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={loadingDocs || docs.length === 0 || downloadingAllDocs}
+                  onClick={() => void descargarTodosDocumentos()}
+                  className="rounded-lg border border-emerald-600 bg-emerald-50 px-3 py-1.5 text-sm font-medium text-emerald-900 hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-500 dark:bg-emerald-950/50 dark:text-emerald-100 dark:hover:bg-emerald-900/60"
+                >
+                  {downloadingAllDocs ? "Descargando…" : "Descargar todos"}
+                </button>
+                <button
+                  type="button"
+                  className="rounded-lg px-3 py-1.5 text-sm text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-900"
+                  onClick={() => {
+                    setDocModal(null);
+                    setDownloadingAllDocs(false);
+                    setPreview(null);
+                    setPdfBlobUrl((prev) => {
+                      if (prev) URL.revokeObjectURL(prev);
+                      return null;
+                    });
+                    setPdfFetchError(null);
+                    setPdfLoading(false);
+                  }}
+                >
+                  Cerrar
+                </button>
+              </div>
             </div>
             <div className="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-[minmax(280px,22%)_1fr] md:gap-0">
               <div className="flex max-h-[40vh] min-h-0 flex-col overflow-hidden border-b border-zinc-200 dark:border-zinc-800 md:max-h-none md:border-b-0 md:border-r">
@@ -863,13 +940,7 @@ export function ComprasmxPanel() {
                 ) : preview.modoPdf ? (
                   <div className="flex min-h-0 flex-1 flex-col">
                     {pdfLoading && !pdfBlobUrl ? (
-                      <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
-                        <p className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Generando vista PDF…</p>
-                        <p className="max-w-md text-xs text-zinc-500">
-                          La conversión puede tardar más de un minuto en documentos grandes. No cierres el modal hasta
-                          que termine.
-                        </p>
-                      </div>
+                      <IndicadorCargaVistaPdf conversionEnServidor={preview.conversionEnServidor} />
                     ) : null}
                     {pdfFetchError ? (
                       <div className="flex flex-1 flex-col gap-3 p-4 text-sm text-red-700 dark:text-red-300">
