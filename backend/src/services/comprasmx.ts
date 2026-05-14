@@ -733,6 +733,90 @@ function baseDirAnexosComprasmx(): string {
   return path.join(process.cwd(), "comprasmx-anexos");
 }
 
+/** Misma ruta que usa el crawler al guardar anexos (`expedienteParaNombreCarpeta` + `COMPRASMX_ANEXOS_DIR`). */
+export function carpetaAbsolutaAnexosPorNumeroIdentificacion(numeroIdentificacion: string): string {
+  const id = numeroIdentificacion.trim();
+  return path.join(baseDirAnexosComprasmx(), expedienteParaNombreCarpeta(id));
+}
+
+export type ComprasmxDocumentoLocalInfo = {
+  nombre: string;
+  sizeBytes: number;
+  modificadoIso: string;
+};
+
+function rutaArchivoDentroDeCarpetaSeguro(dirAbs: string, nombreArchivo: string): string | null {
+  const base = path.resolve(dirAbs);
+  const safeName = path.basename(nombreArchivo.trim());
+  if (!safeName || safeName.startsWith(".")) return null;
+  const target = path.resolve(base, safeName);
+  const rel = path.relative(base, target);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  return target;
+}
+
+/** Lista archivos ya descargados para ese número de identificación (listado). */
+export async function listarDocumentosLocalesComprasmx(numeroIdentificacion: string): Promise<{
+  numeroIdentificacion: string;
+  carpetaEnDisco: string;
+  total: number;
+  documentos: ComprasmxDocumentoLocalInfo[];
+}> {
+  const id = numeroIdentificacion.trim();
+  if (!id) {
+    return { numeroIdentificacion: "", carpetaEnDisco: "", total: 0, documentos: [] };
+  }
+  const carpeta = carpetaAbsolutaAnexosPorNumeroIdentificacion(id);
+  let entries;
+  try {
+    entries = await fs.readdir(carpeta, { withFileTypes: true });
+  } catch (e: unknown) {
+    const code = e && typeof e === "object" && "code" in e ? String((e as NodeJS.ErrnoException).code) : "";
+    if (code === "ENOENT") {
+      return { numeroIdentificacion: id, carpetaEnDisco: carpeta, total: 0, documentos: [] };
+    }
+    throw e;
+  }
+  const documentos: ComprasmxDocumentoLocalInfo[] = [];
+  for (const ent of entries) {
+    if (!ent.isFile() || ent.name.startsWith(".")) continue;
+    const full = path.join(carpeta, ent.name);
+    const st = await fs.stat(full);
+    documentos.push({ nombre: ent.name, sizeBytes: st.size, modificadoIso: st.mtime.toISOString() });
+  }
+  documentos.sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
+  return { numeroIdentificacion: id, carpetaEnDisco: carpeta, total: documentos.length, documentos };
+}
+
+function mimePorNombreArchivo(nombre: string): string {
+  const ext = path.extname(nombre).toLowerCase();
+  if (ext === ".pdf") return "application/pdf";
+  if (ext === ".zip") return "application/zip";
+  if (ext === ".xml") return "application/xml";
+  if (ext === ".json") return "application/json";
+  if (ext === ".csv") return "text/csv";
+  return "application/octet-stream";
+}
+
+/** Resuelve un archivo bajo la carpeta del expediente; evita path traversal. */
+export async function resolverDocumentoLocalComprasmx(
+  numeroIdentificacion: string,
+  nombreArchivo: string,
+): Promise<{ absolutePath: string; mime: string; sizeBytes: number } | null> {
+  const id = numeroIdentificacion.trim();
+  if (!id) return null;
+  const carpeta = carpetaAbsolutaAnexosPorNumeroIdentificacion(id);
+  const target = rutaArchivoDentroDeCarpetaSeguro(carpeta, nombreArchivo);
+  if (!target) return null;
+  try {
+    const st = await fs.stat(target);
+    if (!st.isFile()) return null;
+    return { absolutePath: target, mime: mimePorNombreArchivo(path.basename(target)), sizeBytes: st.size };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Icono de descarga en ANEXOS (PrimeIcons + PrimeNG): clase `pi pi-download`, tooltip «Descargar archivo».
  * No suele ir dentro de `<button>`; el `(click)` va en el `<i>`.

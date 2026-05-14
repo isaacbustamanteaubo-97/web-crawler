@@ -1,9 +1,12 @@
+import path from "node:path";
 import { type NextFunction, type Request, type Response, Router } from "express";
 import {
   fetchComprasmxSnapshot,
   fechaIsoAMexicoDdMmYyyy,
+  listarDocumentosLocalesComprasmx,
   parseEntidadesFederativasCliente,
   parseFechaFiltradoDdMmYyyy,
+  resolverDocumentoLocalComprasmx,
 } from "../services/comprasmx.js";
 
 export const comprasmxRouter = Router();
@@ -60,6 +63,68 @@ function parseFechasFromRequest(req: Request): { desde: string; hasta: string } 
 function fechaIsoSource(req: Request): string | undefined {
   return firstBodyString(req, "fechaISO") ?? firstQueryString(req.query.fechaISO);
 }
+
+/**
+ * Lista PDF/archivos guardados localmente para un número de identificación (misma carpeta que el crawler).
+ * Query obligatorio: `numeroIdentificacion` (como en el listado de Compras MX).
+ * Los archivos existen tras un `/snapshot` con `palabrasClave` que haya descargado anexos.
+ */
+comprasmxRouter.get("/documentos", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = firstQueryString(req.query.numeroIdentificacion);
+    if (!id) {
+      res.status(400).json({
+        error:
+          "Query obligatorio: numeroIdentificacion. Ej. GET /comprasmx/documentos?numeroIdentificacion=AA-012345678",
+      });
+      return;
+    }
+    const data = await listarDocumentosLocalesComprasmx(id);
+    const qs = (nombre: string) =>
+      `${req.baseUrl}/documentos/archivo?${new URLSearchParams({ numeroIdentificacion: data.numeroIdentificacion, nombre }).toString()}`;
+    res.json({
+      ...data,
+      documentos: data.documentos.map((d) => ({
+        ...d,
+        urlDescarga: qs(d.nombre),
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * Sirve un archivo de la carpeta del expediente. Queries: `numeroIdentificacion`, `nombre` (nombre exacto en disco).
+ * Opcional: `disposition=attachment` para forzar descarga.
+ */
+comprasmxRouter.get("/documentos/archivo", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = firstQueryString(req.query.numeroIdentificacion);
+    const nombre = firstQueryString(req.query.nombre);
+    if (!id || !nombre) {
+      res.status(400).json({
+        error:
+          "Queries obligatorios: numeroIdentificacion y nombre (ej. 01_documento.pdf). Lista con GET /comprasmx/documentos?numeroIdentificacion=…",
+      });
+      return;
+    }
+    const meta = await resolverDocumentoLocalComprasmx(id, nombre);
+    if (!meta) {
+      res.status(404).json({ error: "Archivo no encontrado o ruta no permitida." });
+      return;
+    }
+    const attachment = firstQueryString(req.query.disposition)?.toLowerCase() === "attachment";
+    const base = path.basename(meta.absolutePath);
+    res.setHeader("Content-Type", meta.mime);
+    res.setHeader("Content-Disposition", `${attachment ? "attachment" : "inline"}; filename="${base.replace(/"/g, "")}"`);
+    res.sendFile(meta.absolutePath, (err) => {
+      if (err && !res.headersSent) next(err);
+    });
+  } catch (err) {
+    next(err);
+  }
+});
 
 comprasmxRouter.post("/snapshot", async (req: Request, res: Response, next: NextFunction) => {
   try {
