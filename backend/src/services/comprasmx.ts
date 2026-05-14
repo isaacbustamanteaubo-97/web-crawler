@@ -34,6 +34,45 @@ export const ENTIDADES_FEDERATIVAS_FILTRO = [
   "YUCATÁN",
 ] as const;
 
+/**
+ * Las 32 entidades federativas (nombres en mayúsculas alineados al portal).
+ * Sirve para validar `entidadesFederativas` del API; el crawler usa esto al marcar el multiselect.
+ */
+export const ENTIDADES_FEDERATIVAS_TODAS = [
+  "AGUASCALIENTES",
+  "BAJA CALIFORNIA",
+  "BAJA CALIFORNIA SUR",
+  "CAMPECHE",
+  "COAHUILA DE ZARAGOZA",
+  "COLIMA",
+  "CHIAPAS",
+  "CHIHUAHUA",
+  "CIUDAD DE MÉXICO",
+  "DURANGO",
+  "GUANAJUATO",
+  "GUERRERO",
+  "HIDALGO",
+  "JALISCO",
+  "MÉXICO",
+  "MICHOACÁN DE OCAMPO",
+  "MORELOS",
+  "NAYARIT",
+  "NUEVO LEÓN",
+  "OAXACA",
+  "PUEBLA",
+  "QUERÉTARO",
+  "QUINTANA ROO",
+  "SAN LUIS POTOSÍ",
+  "SINALOA",
+  "SONORA",
+  "TABASCO",
+  "TAMAULIPAS",
+  "TLAXCALA",
+  "VERACRUZ DE IGNACIO DE LA LLAVE",
+  "YUCATÁN",
+  "ZACATECAS",
+] as const;
+
 function normEntidadNombre(s: string): string {
   return s
     .normalize("NFD")
@@ -43,9 +82,32 @@ function normEntidadNombre(s: string): string {
     .replace(/\s+/g, " ");
 }
 
-const ENTIDAD_CANONICA_POR_NORMALIZADO: ReadonlyMap<string, string> = new Map(
-  ENTIDADES_FEDERATIVAS_FILTRO.map((e) => [normEntidadNombre(e), e]),
-);
+function mapEntidadesCanon(): Map<string, string> {
+  const m = new Map<string, string>();
+  for (const e of ENTIDADES_FEDERATIVAS_TODAS) {
+    m.set(normEntidadNombre(e), e);
+  }
+  /** Alias frecuentes (entrada del cliente → canónico del portal). */
+  const aliases: ReadonlyArray<readonly [string, string]> = [
+    ["estado de mexico", "MÉXICO"],
+    ["edomex", "MÉXICO"],
+    ["michoacan", "MICHOACÁN DE OCAMPO"],
+    ["michoacan de ocampo", "MICHOACÁN DE OCAMPO"],
+    ["coahuila", "COAHUILA DE ZARAGOZA"],
+    ["veracruz", "VERACRUZ DE IGNACIO DE LA LLAVE"],
+    ["queretaro", "QUERÉTARO"],
+    ["san luis potosi", "SAN LUIS POTOSÍ"],
+    ["nuevo leon", "NUEVO LEÓN"],
+    ["ciudad de mexico", "CIUDAD DE MÉXICO"],
+    ["cdmx", "CIUDAD DE MÉXICO"],
+  ];
+  for (const [k, canon] of aliases) {
+    if (!m.has(k)) m.set(k, canon);
+  }
+  return m;
+}
+
+const ENTIDAD_CANONICA_POR_NORMALIZADO: ReadonlyMap<string, string> = mapEntidadesCanon();
 
 /**
  * Interpreta `entidadesFederativas` del cliente.
@@ -79,7 +141,7 @@ export function parseEntidadesFederativasCliente(raw: unknown): { values?: strin
   }
   if (invalid.length) {
     return {
-      error: `Entidades no reconocidas: ${invalid.join(", ")}. Valores admitidos: ${ENTIDADES_FEDERATIVAS_FILTRO.join(", ")}.`,
+      error: `Entidades no reconocidas: ${invalid.join(", ")}. Lista canónica: GET /comprasmx/entidades`,
     };
   }
   return { values: out };

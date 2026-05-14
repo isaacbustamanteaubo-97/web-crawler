@@ -1,6 +1,7 @@
 import path from "node:path";
 import { type NextFunction, type Request, type Response, Router } from "express";
 import {
+  ENTIDADES_FEDERATIVAS_TODAS,
   fetchComprasmxSnapshot,
   fechaIsoAMexicoDdMmYyyy,
   listarDocumentosLocalesComprasmx,
@@ -10,6 +11,11 @@ import {
 } from "../services/comprasmx.js";
 
 export const comprasmxRouter = Router();
+
+/** Nombres canónicos de las 32 entidades (mismo criterio que valida POST /snapshot). */
+comprasmxRouter.get("/entidades", (_req: Request, res: Response) => {
+  res.json({ entidades: [...ENTIDADES_FEDERATIVAS_TODAS] });
+});
 
 function requestBodyRecord(req: Request): Record<string, unknown> {
   const b = req.body;
