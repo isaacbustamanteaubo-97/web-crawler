@@ -15,6 +15,10 @@ import {
   type FetchComprasmxOptions,
 } from "../services/comprasmx.js";
 import {
+  parseFilasExportBody,
+  streamExportLicitacionesZip,
+} from "../services/exportLicitaciones.js";
+import {
   esNombreArchivoConvertibleVistaPdf,
   resolverPdfVistaPrevia,
 } from "../services/officePdfPreview.js";
@@ -385,6 +389,25 @@ comprasmxRouter.get("/documentos/archivo", async (req: Request, res: Response, n
     res.sendFile(meta.absolutePath, (err) => {
       if (err && !esAbortoClienteSendfile(err) && !res.headersSent) next(err);
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+comprasmxRouter.post("/export", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const parsed = parseFilasExportBody(req.body);
+    if (!parsed.ok) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    const body = requestBodyRecord(req);
+    const fetchedAt = typeof body.fetchedAt === "string" ? body.fetchedAt : undefined;
+    const filtros =
+      body.filtros && typeof body.filtros === "object" && !Array.isArray(body.filtros)
+        ? (body.filtros as Record<string, unknown>)
+        : undefined;
+    await streamExportLicitacionesZip({ filas: parsed.filas, fetchedAt, filtros }, res);
   } catch (err) {
     next(err);
   }

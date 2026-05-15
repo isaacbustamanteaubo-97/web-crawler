@@ -800,7 +800,7 @@ type RawDetalleProcedimiento = {
   anexos: Array<{ titulo: string; urlDescarga: string }>;
 };
 
-function expedienteParaNombreCarpeta(id: string): string {
+export function expedienteParaNombreCarpeta(id: string): string {
   const s = id
     .replace(/[^\p{L}\p{N}._-]+/gu, "_")
     .replace(/_+/g, "_")

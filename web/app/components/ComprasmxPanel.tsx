@@ -237,6 +237,9 @@ export function ComprasmxPanel() {
   const [historialOpen, setHistorialOpen] = useState(false);
   const [historialLista, setHistorialLista] = useState<ComprasmxHistoryEntry[]>([]);
 
+  const [exportingAll, setExportingAll] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+
   useEffect(() => {
     let cancel = false;
     (async () => {
@@ -499,6 +502,7 @@ export function ComprasmxPanel() {
           return;
         }
         if (o.type === "done" && o.payload && typeof o.payload === "object") {
+          setExportError(null);
           setSnapshot(o.payload as SnapshotResponse);
           const persisted = appendSnapshotHistoryEntry(o.payload);
           activeHistoryEntryIdRef.current = persisted.ok ? persisted.id : null;
@@ -559,7 +563,9 @@ export function ComprasmxPanel() {
     snapshotAbortRef.current?.abort();
     setSnapshotProgressOpen(false);
     setSnapshotProgressLog([]);
-    setSnapshotStreamDone(false);
+    setSnapshotStreamDone(true);
+    setLoadingSnap(false);
+    snapshotAbortRef.current = null;
   }, []);
 
   const abrirHistorial = useCallback(() => {
@@ -592,6 +598,51 @@ export function ComprasmxPanel() {
     activeHistoryEntryIdRef.current = null;
     setSnapshot(null);
   }, []);
+
+  const exportarTodasLicitaciones = useCallback(async () => {
+    const filas = snapshot?.filas ?? [];
+    if (filas.length === 0) return;
+    setExportingAll(true);
+    setExportError(null);
+    try {
+      const r = await fetch(`${api}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filas,
+          fetchedAt: snapshot?.fetchedAt,
+          filtros: snapshot?.filtros,
+        }),
+      });
+      if (!r.ok) {
+        let msg = `Exportación falló (${r.status})`;
+        try {
+          const j = (await r.json()) as { error?: string };
+          if (typeof j.error === "string") msg = j.error;
+        } catch {
+          /* ignore */
+        }
+        throw new Error(msg);
+      }
+      const blob = await r.blob();
+      const disp = r.headers.get("Content-Disposition") ?? "";
+      const m = /filename="?([^";\n]+)"?/i.exec(disp);
+      const filename = m?.[1]?.trim() || `comprasmx-export-${fechaISO.trim() || "busqueda"}.zip`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.rel = "noopener";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setExportError(mensajeErrorConexionComprasmxApi(e, "generico"));
+    } finally {
+      setExportingAll(false);
+    }
+  }, [api, fechaISO, snapshot]);
 
   const abrirDocumentos = useCallback(
     async (numeroIdentificacion: string) => {
@@ -1073,9 +1124,24 @@ export function ComprasmxPanel() {
 
       {snapshot ? (
         <section className="rounded-xl border border-zinc-200 bg-white p-5 shadow-sm dark:border-zinc-800 dark:bg-zinc-950 sm:p-6">
-          <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
-            Resultados ({snapshot.totalFilas ?? snapshot.filas?.length ?? 0})
-          </h2>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
+              Resultados ({snapshot.totalFilas ?? snapshot.filas?.length ?? 0})
+            </h2>
+            <button
+              type="button"
+              disabled={exportingAll || (snapshot.filas?.length ?? 0) === 0}
+              onClick={() => void exportarTodasLicitaciones()}
+              className="shrink-0 rounded-lg border border-emerald-700 bg-white px-4 py-2 text-sm font-semibold text-emerald-800 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-500 dark:bg-zinc-950 dark:text-emerald-300 dark:hover:bg-emerald-950/40"
+            >
+              {exportingAll ? "Generando ZIP…" : "Exportar todo (ZIP + Word)"}
+            </button>
+          </div>
+          {exportError ? (
+            <p className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
+              {exportError}
+            </p>
+          ) : null}
           <ul className="mt-6 flex flex-col gap-6">
             {(snapshot.filas ?? []).map((f) => (
               <li
