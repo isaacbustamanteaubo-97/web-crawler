@@ -20,6 +20,8 @@ export type ComprasmxHistoryEntry = {
   storedAt: string;
   /** `fetchedAt` del payload del servidor, si existe. */
   serverFetchedAt?: string;
+  /** Id del JSON en Google Drive (`GET /comprasmx/snapshots/:id`). */
+  serverPersistId?: string;
   resumen: string;
   snapshotJson: unknown;
   documentosPorExpediente?: Record<string, HistorialDocumentoFila[]>;
@@ -66,7 +68,10 @@ function resumenDesdePayload(snapshot: unknown): string {
 /**
  * Añade una entrada al inicio del historial. Si no cabe por cuota, recorta entradas viejas y reintenta.
  */
-export function appendSnapshotHistoryEntry(snapshot: unknown): { ok: boolean; id: string } {
+export function appendSnapshotHistoryEntry(
+  snapshot: unknown,
+  serverPersistId?: string,
+): { ok: boolean; id: string } {
   const id =
     typeof crypto !== "undefined" && "randomUUID" in crypto
       ? crypto.randomUUID()
@@ -74,11 +79,14 @@ export function appendSnapshotHistoryEntry(snapshot: unknown): { ok: boolean; id
 
   const payload = snapshot && typeof snapshot === "object" ? (snapshot as Record<string, unknown>) : {};
   const serverFetchedAt = typeof payload.fetchedAt === "string" ? payload.fetchedAt : undefined;
+  const persistIdFromPayload =
+    typeof payload.snapshotPersistId === "string" ? payload.snapshotPersistId.trim() : undefined;
 
   const entry: ComprasmxHistoryEntry = {
     id,
     storedAt: new Date().toISOString(),
     serverFetchedAt,
+    serverPersistId: serverPersistId?.trim() || persistIdFromPayload || undefined,
     resumen: resumenDesdePayload(snapshot),
     snapshotJson: snapshot,
     documentosPorExpediente: {},

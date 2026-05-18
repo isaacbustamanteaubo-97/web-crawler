@@ -1,7 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
-import { comprasmxApiBase, mensajeErrorConexionComprasmxApi, proxiedComprasmxUrl } from "@/lib/comprasmx-api";
+import {
+  comprasmxApiBase,
+  mensajeErrorConexionComprasmxApi,
+  proxiedComprasmxUrl,
+  readComprasmxJsonResponse,
+} from "@/lib/comprasmx-api";
 import {
   appendSnapshotHistoryEntry,
   clearSnapshotHistory,
@@ -49,8 +54,18 @@ type SnapshotResponse = {
   filtros?: Record<string, unknown>;
   /** Viene del API al completar el snapshot. */
   fetchedAt?: string;
+  /** Id en Google Drive del JSON guardado por el backend. */
+  snapshotPersistId?: string;
   source?: string;
   error?: string;
+};
+
+type SnapshotPersistedMeta = {
+  id: string;
+  savedAt: string;
+  serverFetchedAt?: string;
+  resumen: string;
+  totalFilas: number;
 };
 
 type DocumentoRow = {
@@ -236,6 +251,9 @@ export function ComprasmxPanel() {
 
   const [historialOpen, setHistorialOpen] = useState(false);
   const [historialLista, setHistorialLista] = useState<ComprasmxHistoryEntry[]>([]);
+  const [historialServidor, setHistorialServidor] = useState<SnapshotPersistedMeta[]>([]);
+  const [historialServidorError, setHistorialServidorError] = useState<string | null>(null);
+  const [cargandoHistorialServidor, setCargandoHistorialServidor] = useState(false);
 
   const [exportingAll, setExportingAll] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
@@ -245,10 +263,10 @@ export function ComprasmxPanel() {
     (async () => {
       try {
         const r = await fetch(`${api}/entidades`);
-        if (!r.ok) return;
-        const j = (await r.json()) as { entidades?: string[] };
-        if (cancel || !Array.isArray(j.entidades) || j.entidades.length === 0) return;
-        setEntidadesLista(j.entidades);
+        const parsed = await readComprasmxJsonResponse<{ entidades?: string[] }>(r);
+        if (!parsed.ok || cancel) return;
+        if (!Array.isArray(parsed.data.entidades) || parsed.data.entidades.length === 0) return;
+        setEntidadesLista(parsed.data.entidades);
       } catch {
         /* fallback ENTIDADES_TODAS_FALLBACK */
       }
@@ -286,7 +304,16 @@ export function ComprasmxPanel() {
           if (r.status === 502 || r.status === 503 || r.status === 504) {
             throw new Error("proxy");
           }
+          const ct = r.headers.get("content-type") ?? "";
           const t = await r.text().catch(() => "");
+          if (ct.includes("application/json") && t.trim()) {
+            try {
+              const j = JSON.parse(t) as { error?: string };
+              if (typeof j.error === "string" && j.error.trim()) throw new Error(j.error);
+            } catch (e) {
+              if (e instanceof Error && e.message !== t) throw e;
+            }
+          }
           throw new Error(t.slice(0, 500) || `HTTP ${r.status}`);
         }
         const blob = await r.blob();
@@ -570,8 +597,52 @@ export function ComprasmxPanel() {
 
   const abrirHistorial = useCallback(() => {
     setHistorialLista(listSnapshotHistory());
+    setHistorialServidor([]);
+    setHistorialServidorError(null);
     setHistorialOpen(true);
-  }, []);
+    void (async () => {
+      setCargandoHistorialServidor(true);
+      try {
+        const r = await fetch(`${api}/snapshots`);
+        const parsed = await readComprasmxJsonResponse<{ snapshots?: SnapshotPersistedMeta[] }>(r);
+        if (!parsed.ok) {
+          setHistorialServidorError(parsed.error);
+          return;
+        }
+        setHistorialServidor(Array.isArray(parsed.data.snapshots) ? parsed.data.snapshots : []);
+      } catch (e) {
+        setHistorialServidorError(mensajeErrorConexionComprasmxApi(e, "generico"));
+      } finally {
+        setCargandoHistorialServidor(false);
+      }
+    })();
+  }, [api]);
+
+  const restaurarSnapshotDesdeDrive = useCallback(
+    async (serverId: string) => {
+      setSnapError(null);
+      try {
+        const r = await fetch(`${api}/snapshots/${encodeURIComponent(serverId)}`);
+        const parsed = await readComprasmxJsonResponse<{ payload?: SnapshotResponse; id?: string }>(r);
+        if (!parsed.ok) {
+          setSnapError(parsed.error);
+          return;
+        }
+        const record = parsed.data;
+        if (!record.payload) {
+          setSnapError("Respuesta del servidor sin datos de snapshot.");
+          return;
+        }
+        setSnapshot(record.payload);
+        const persisted = appendSnapshotHistoryEntry(record.payload, record.id ?? serverId);
+        activeHistoryEntryIdRef.current = persisted.ok ? persisted.id : null;
+        setHistorialOpen(false);
+      } catch (e) {
+        setSnapError(mensajeErrorConexionComprasmxApi(e, "generico"));
+      }
+    },
+    [api],
+  );
 
   const aplicarEntradaHistorial = useCallback((id: string) => {
     const e = getHistoryEntry(id);
@@ -671,11 +742,12 @@ export function ComprasmxPanel() {
       setLoadingDocs(true);
       try {
         const r = await fetch(`${api}/documentos?${new URLSearchParams({ numeroIdentificacion: idTrim }).toString()}`);
-        const j = (await r.json()) as DocumentosResponse & { error?: string };
-        if (!r.ok) {
-          setDocsError(j.error ?? `Error ${r.status}`);
+        const parsed = await readComprasmxJsonResponse<DocumentosResponse>(r);
+        if (!parsed.ok) {
+          setDocsError(parsed.error);
           return;
         }
+        const j = parsed.data;
         const zipHref =
           typeof j.urlZip === "string"
             ? proxiedComprasmxUrl(j.urlZip)
@@ -717,10 +789,12 @@ export function ComprasmxPanel() {
         void cargarTextoPreview(d.nombre, d.urlDescarga);
         return;
       }
-      if (cat === "pdf" || d.urlVistaPdf) {
-        const url = d.urlVistaPdf ?? d.urlDescarga;
-        const conversionEnServidor = Boolean(d.urlVistaPdf && cat !== "pdf");
-        setPreview({ nombre: d.nombre, url, modoPdf: true, conversionEnServidor });
+      if (cat === "pdf") {
+        setPreview({ nombre: d.nombre, url: d.urlDescarga, modoPdf: true, conversionEnServidor: false });
+        return;
+      }
+      if (d.urlVistaPdf) {
+        setPreview({ nombre: d.nombre, url: d.urlVistaPdf, modoPdf: true, conversionEnServidor: true });
         return;
       }
       if (cat === "imagen") {
@@ -869,19 +943,57 @@ export function ComprasmxPanel() {
                 Historial local
               </h2>
               <p className="mt-1 text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
-                Cada búsqueda exitosa se guarda en este navegador. Las URLs de documentos apuntan al API (p. ej. vía{" "}
-                <code className="rounded bg-zinc-200 px-0.5 font-mono text-[10px] dark:bg-zinc-800">/api/comprasmx</code>
-                ); hace falta que el <strong>backend esté en marcha</strong> para ver PDFs o listar archivos. Si abriste
-                documentos antes, las rutas se reutilizan; los archivos siguen viviendo en el servidor (no en el
-                navegador).
+                Cada búsqueda exitosa se guarda en este navegador. Con Drive activo, el JSON se sube en segundo plano a{" "}
+                <strong>Google Drive</strong> (aparece abajo al abrir historial). Los documentos siguen en el API / Drive;
+                hace falta que el <strong>backend esté en marcha</strong> para listarlos o previsualizarlos.
               </p>
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-4">
-              {historialLista.length === 0 ? (
-                <p className="py-8 text-center text-sm text-zinc-500 dark:text-zinc-400">
-                  Aún no hay snapshots guardados. Ejecuta una búsqueda para crear el primero.
+              {cargandoHistorialServidor ? (
+                <p className="mb-3 text-xs text-zinc-500">Sincronizando historial desde Drive…</p>
+              ) : null}
+              {historialServidorError ? (
+                <p className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">
+                  Drive: {historialServidorError}
                 </p>
-              ) : (
+              ) : null}
+              {historialServidor.length > 0 ? (
+                <div className="mb-4">
+                  <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+                    En Google Drive
+                  </h3>
+                  <ul className="flex flex-col gap-2">
+                    {historialServidor
+                      .filter((s) => !historialLista.some((h) => h.serverPersistId === s.id))
+                      .map((s) => (
+                        <li
+                          key={s.id}
+                          className="rounded-lg border border-sky-200 bg-sky-50/80 px-3 py-2.5 dark:border-sky-900 dark:bg-sky-950/30"
+                        >
+                          <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">{s.resumen}</p>
+                          <p className="mt-0.5 text-[11px] text-zinc-500">
+                            {new Date(s.savedAt).toLocaleString("es-MX", {
+                              dateStyle: "short",
+                              timeStyle: "short",
+                            })}
+                          </p>
+                          <button
+                            type="button"
+                            className="mt-2 rounded-md bg-sky-700 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-sky-800"
+                            onClick={() => void restaurarSnapshotDesdeDrive(s.id)}
+                          >
+                            Restaurar desde Drive
+                          </button>
+                        </li>
+                      ))}
+                  </ul>
+                </div>
+              ) : null}
+              {historialLista.length === 0 && historialServidor.length === 0 && !cargandoHistorialServidor ? (
+                <p className="py-8 text-center text-sm text-zinc-500 dark:text-zinc-400">
+                  Aún no hay snapshots guardados en este navegador. Ejecuta una búsqueda para crear el primero.
+                </p>
+              ) : historialLista.length === 0 ? null : (
                 <ul className="flex flex-col gap-2">
                   {historialLista.map((row) => {
                     const nDocs = row.documentosPorExpediente
@@ -1297,8 +1409,7 @@ export function ComprasmxPanel() {
                   <div className="flex flex-col gap-3 p-4 text-sm text-zinc-700 dark:text-zinc-300">
                     <p>
                       Vista previa no disponible para <strong>{extDeNombre(preview.nombre) || "este formato"}</strong>.
-                      Convierte a PDF en el servidor si necesitas verlo aquí, o descarga y ábrelo en Word / PowerPoint /
-                      Excel.
+                      Descarga el archivo y ábrelo en Word, PowerPoint o Excel.
                     </p>
                     <a
                       href={preview.url}

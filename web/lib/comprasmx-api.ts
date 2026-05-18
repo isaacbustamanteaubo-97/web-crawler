@@ -12,6 +12,55 @@ export function comprasmxApiBase(): string {
 }
 
 /** Convierte rutas que devuelve Express (`/comprasmx/...`) en URL usable desde el front. */
+export type ComprasmxJsonResult<T> =
+  | { ok: true; status: number; data: T }
+  | { ok: false; status: number; data: null; error: string };
+
+/**
+ * Lee el cuerpo como JSON sin lanzar si el proxy devolvió texto ("Internal Server Error").
+ */
+export async function readComprasmxJsonResponse<T>(r: Response): Promise<ComprasmxJsonResult<T>> {
+  const text = await r.text();
+  const trimmed = text.trim();
+
+  if (!trimmed) {
+    const vacio = r.ok ? "Respuesta vacía del API." : `Error ${r.status} (respuesta vacía).`;
+    return { ok: false, status: r.status, data: null, error: vacio };
+  }
+
+  const pareceHtmlOProxy =
+    trimmed.startsWith("Internal Server Error") ||
+    trimmed.startsWith("<!DOCTYPE") ||
+    trimmed.startsWith("<html");
+
+  if (pareceHtmlOProxy) {
+    return {
+      ok: false,
+      status: r.status,
+      data: null,
+      error:
+        "No se pudo conectar con el API Compras MX. Arranca el backend (cd backend && yarn dev, puerto 8000 por defecto) y deja Next en marcha para el proxy /api/comprasmx.",
+    };
+  }
+
+  try {
+    const data = JSON.parse(trimmed) as T;
+    if (!r.ok) {
+      const errField = (data as { error?: unknown })?.error;
+      const msg = typeof errField === "string" && errField.trim() ? errField : `Error ${r.status}`;
+      return { ok: false, status: r.status, data: null, error: msg };
+    }
+    return { ok: true, status: r.status, data };
+  } catch {
+    return {
+      ok: false,
+      status: r.status,
+      data: null,
+      error: `Respuesta no es JSON válido (HTTP ${r.status}). Revisa que el backend esté en marcha en ${process.env.BACKEND_PROXY_URL ?? "http://127.0.0.1:8000"}.`,
+    };
+  }
+}
+
 export function proxiedComprasmxUrl(pathOrUrl: string): string {
   const base = comprasmxApiBase();
   if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) {
@@ -49,6 +98,14 @@ export function mensajeErrorConexionComprasmxApi(err: unknown, context: "pdf" | 
     t.includes("network request failed") ||
     t.includes("load failed") ||
     t.includes("econnrefused");
+
+  if (
+    t.includes("not valid json") ||
+    t.includes("unexpected token") ||
+    t.includes("respuesta no es json")
+  ) {
+    return "No se pudo leer la respuesta del API (no es JSON). Comprueba que el backend esté corriendo (cd backend && yarn dev) mientras usas el front en localhost:3000.";
+  }
 
   if (pareceRed) {
     const detalle =

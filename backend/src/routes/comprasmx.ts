@@ -1,8 +1,13 @@
-import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import archiver from "archiver";
+import { pipeline } from "node:stream/promises";
 import { type NextFunction, type Request, type Response, Router } from "express";
+import {
+  crearReadStreamDocumento,
+  materializarDocumentoATemp,
+  resolverDocumentoComprasmx,
+} from "../services/anexoStorage.js";
 import {
   ENTIDADES_FEDERATIVAS_TODAS,
   esCancelacionCliente,
@@ -11,9 +16,15 @@ import {
   listarDocumentosLocalesComprasmx,
   parseEntidadesFederativasCliente,
   parseFechaFiltradoDdMmYyyy,
-  resolverDocumentoLocalComprasmx,
+  type ComprasmxSnapshot,
   type FetchComprasmxOptions,
 } from "../services/comprasmx.js";
+import {
+  getPersistedSnapshot,
+  listPersistedSnapshots,
+  persistSnapshotResponse,
+  snapshotsPersistenceAvailable,
+} from "../services/snapshotPersistence.js";
 import {
   parseFilasExportBody,
   streamExportLicitacionesZip,
@@ -152,6 +163,56 @@ comprasmxRouter.get("/entidades", (_req: Request, res: Response) => {
   res.json({ entidades: [...ENTIDADES_FEDERATIVAS_TODAS] });
 });
 
+/** Sube el JSON a Drive sin bloquear la respuesta HTTP al cliente. */
+function programarPersistenciaSnapshotEnDrive(data: ComprasmxSnapshot): void {
+  if (!snapshotsPersistenceAvailable()) return;
+  void persistSnapshotResponse(data)
+    .then((id) => {
+      console.log(`[comprasmx] Snapshot JSON guardado en Drive (background): ${id}`);
+    })
+    .catch((err) => {
+      console.error("[comprasmx] Error guardando snapshot JSON en Drive (background):", err);
+    });
+}
+
+/** Lista snapshots guardados en Google Drive (`_comprasmx_snapshots/`). */
+comprasmxRouter.get("/snapshots", async (_req: Request, res: Response) => {
+  try {
+    if (!snapshotsPersistenceAvailable()) {
+      res.status(503).json({
+        error: "Snapshots en Drive no disponibles. Activa GOOGLE_DRIVE_ENABLED y credenciales.",
+      });
+      return;
+    }
+    const snapshots = await listPersistedSnapshots();
+    res.json({ snapshots, storage: "drive" as const });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(503).json({ error: `No se pudo listar snapshots en Drive: ${msg}` });
+  }
+});
+
+/** Recupera el JSON completo de un snapshot guardado en Drive. */
+comprasmxRouter.get("/snapshots/:id", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!snapshotsPersistenceAvailable()) {
+      res.status(503).json({
+        error: "Snapshots en Drive no disponibles. Activa GOOGLE_DRIVE_ENABLED y credenciales.",
+      });
+      return;
+    }
+    const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
+    const record = await getPersistedSnapshot(id);
+    if (!record) {
+      res.status(404).json({ error: "Snapshot no encontrado en Drive." });
+      return;
+    }
+    res.json(record);
+  } catch (err) {
+    next(err);
+  }
+});
+
 function requestBodyRecord(req: Request): Record<string, unknown> {
   const b = req.body;
   if (b && typeof b === "object" && !Array.isArray(b)) return b as Record<string, unknown>;
@@ -220,7 +281,16 @@ comprasmxRouter.get("/documentos", async (req: Request, res: Response, next: Nex
       });
       return;
     }
-    const data = await listarDocumentosLocalesComprasmx(id);
+    let data;
+    try {
+      data = await listarDocumentosLocalesComprasmx(id);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      res.status(503).json({
+        error: `No se pudo listar documentos (Drive/local): ${msg}`,
+      });
+      return;
+    }
     const qs = (nombre: string) =>
       `${req.baseUrl}/documentos/archivo?${new URLSearchParams({ numeroIdentificacion: data.numeroIdentificacion, nombre }).toString()}`;
     const qsVistaPdf = (nombre: string) =>
@@ -234,10 +304,9 @@ comprasmxRouter.get("/documentos", async (req: Request, res: Response, next: Nex
       ...data,
       urlZip,
       documentos: data.documentos.map((d) => {
-        const nombreLower = d.nombre.trim().toLowerCase();
-        const esPdf = nombreLower.endsWith(".pdf");
-        const urlVistaPdf =
-          esNombreArchivoConvertibleVistaPdf(d.nombre) || esPdf ? qsVistaPdf(d.nombre) : undefined;
+        const officePreview =
+          process.env.COMPRASMX_OFFICE_PDF_PREVIEW === "1" && esNombreArchivoConvertibleVistaPdf(d.nombre);
+        const urlVistaPdf = officePreview ? qsVistaPdf(d.nombre) : undefined;
         return {
           ...d,
           urlDescarga: qs(d.nombre),
@@ -266,7 +335,7 @@ comprasmxRouter.get("/documentos/zip", async (req: Request, res: Response, next:
     }
     const data = await listarDocumentosLocalesComprasmx(id);
     if (data.total === 0) {
-      res.status(404).json({ error: "No hay archivos locales para este expediente. Ejecuta un snapshot con descarga de anexos primero." });
+      res.status(404).json({ error: "No hay archivos para este expediente. Ejecuta un snapshot con descarga de anexos primero." });
       return;
     }
 
@@ -303,9 +372,10 @@ comprasmxRouter.get("/documentos/zip", async (req: Request, res: Response, next:
     req.on("close", onClose);
     try {
       for (const d of data.documentos) {
-        const meta = await resolverDocumentoLocalComprasmx(data.numeroIdentificacion, d.nombre);
+        const meta = await resolverDocumentoComprasmx(data.numeroIdentificacion, d.nombre);
         if (!meta) continue;
-        archive.append(createReadStream(meta.absolutePath), { name: d.nombre });
+        const stream = await crearReadStreamDocumento(meta);
+        archive.append(stream, { name: d.nombre });
       }
       await archive.finalize();
     } finally {
@@ -333,35 +403,49 @@ comprasmxRouter.get("/documentos/archivo", async (req: Request, res: Response, n
       });
       return;
     }
-    const meta = await resolverDocumentoLocalComprasmx(id, nombre);
+    const meta = await resolverDocumentoComprasmx(id, nombre);
     if (!meta) {
       res.status(404).json({ error: "Archivo no encontrado o ruta no permitida." });
       return;
     }
     const attachment = firstQueryString(req.query.disposition)?.toLowerCase() === "attachment";
     const vistaPdf = firstQueryString(req.query.vista)?.toLowerCase() === "pdf";
+    const fnameSafe = path.basename(meta.nombre).replace(/"/g, "");
 
     /** Vista PDF en navegador: PDF nativo se sirve tal cual; el resto (Office, etc.) pasa por LibreOffice solo aquí. */
     if (vistaPdf) {
       const ext = extArchivoLower(nombre);
       if (ext === "pdf") {
-        const base = path.basename(meta.absolutePath);
-        res.setHeader("Content-Type", "application/pdf");
-        res.setHeader("Content-Disposition", `${attachment ? "attachment" : "inline"}; filename="${base.replace(/"/g, "")}"`);
-        res.sendFile(meta.absolutePath, (err) => {
-          if (err && !esAbortoClienteSendfile(err) && !res.headersSent) next(err);
+        res.redirect(
+          302,
+          `${req.baseUrl}/documentos/archivo?${new URLSearchParams({
+            numeroIdentificacion: id,
+            nombre,
+            ...(attachment ? { disposition: "attachment" } : {}),
+          }).toString()}`,
+        );
+        return;
+      }
+      if (process.env.COMPRASMX_OFFICE_PDF_PREVIEW !== "1") {
+        res.status(501).json({
+          error:
+            "Vista PDF de Office desactivada. Usa la descarga directa o define COMPRASMX_OFFICE_PDF_PREVIEW=1 y LibreOffice.",
         });
         return;
       }
       if (!esNombreArchivoConvertibleVistaPdf(nombre)) {
         res.status(400).json({
-          error:
-            "vista=pdf solo convierte formatos Office u hoja de cálculo admitidos. Los PDF se sirven sin vista=pdf (o con vista=pdf se reenvía el mismo archivo sin conversión).",
+          error: "vista=pdf solo aplica a formatos Office admitidos o archivos PDF (use la URL sin vista=pdf).",
         });
         return;
       }
+      let tempOrigen: string | null = null;
       try {
-        const pdfAbs = await resolverPdfVistaPrevia(meta.absolutePath);
+        tempOrigen =
+          meta.storage === "local" && meta.absolutePath
+            ? meta.absolutePath
+            : await materializarDocumentoATemp(meta);
+        const pdfAbs = await resolverPdfVistaPrevia(tempOrigen);
         const stem = path.basename(nombre, path.extname(nombre));
         const fname = `${stem}.pdf`.replace(/"/g, "");
         const buf = await fs.readFile(pdfAbs);
@@ -372,23 +456,39 @@ comprasmxRouter.get("/documentos/archivo", async (req: Request, res: Response, n
         return;
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        const code = msg.includes("ENOENT") || msg.toLowerCase().includes("spawn") ? 503 : 500;
-        res.status(code).json({
-          error:
-            code === 503
-              ? "No se pudo ejecutar LibreOffice (`soffice`). Instálalo o define LIBREOFFICE_SOFFICE con la ruta al binario."
-              : msg,
+        const errno = e && typeof e === "object" && "code" in e ? String((e as NodeJS.ErrnoException).code) : "";
+        const sinLibreOffice =
+          errno === "ENOENT" || msg.includes("ENOENT") || msg.toLowerCase().includes("spawn");
+        res.status(sinLibreOffice ? 503 : 500).json({
+          error: sinLibreOffice
+            ? "No se pudo ejecutar LibreOffice (`soffice`). Instálalo o define LIBREOFFICE_SOFFICE con la ruta al binario."
+            : msg,
         });
         return;
+      } finally {
+        if (tempOrigen && meta.storage === "drive") {
+          await fs.rm(path.dirname(tempOrigen), { recursive: true, force: true }).catch(() => {});
+        }
       }
     }
 
-    const base = path.basename(meta.absolutePath);
     res.setHeader("Content-Type", meta.mime);
-    res.setHeader("Content-Disposition", `${attachment ? "attachment" : "inline"}; filename="${base.replace(/"/g, "")}"`);
-    res.sendFile(meta.absolutePath, (err) => {
-      if (err && !esAbortoClienteSendfile(err) && !res.headersSent) next(err);
-    });
+    res.setHeader("Content-Disposition", `${attachment ? "attachment" : "inline"}; filename="${fnameSafe}"`);
+    if (meta.storage === "local" && meta.absolutePath) {
+      res.sendFile(meta.absolutePath, (err) => {
+        if (err && !esAbortoClienteSendfile(err) && !res.headersSent) next(err);
+      });
+      return;
+    }
+    try {
+      const stream = await crearReadStreamDocumento(meta);
+      await pipeline(stream, res);
+    } catch (e) {
+      if (!res.headersSent) {
+        const msg = e instanceof Error ? e.message : String(e);
+        res.status(502).json({ error: `No se pudo leer el archivo: ${msg}` });
+      }
+    }
   } catch (err) {
     next(err);
   }
@@ -428,6 +528,7 @@ comprasmxRouter.post("/snapshot", async (req: Request, res: Response, next: Next
     res.on("close", onClientDisconnected);
     try {
       const data = await fetchComprasmxSnapshot({ ...parsed.fetchOpts, signal: ac.signal });
+      programarPersistenciaSnapshotEnDrive(data);
       res.json(data);
     } finally {
       res.off("close", onClientDisconnected);
@@ -473,6 +574,7 @@ comprasmxRouter.post("/snapshot/stream", async (req: Request, res: Response, nex
       signal: ac.signal,
       onProgress: (ev) => writeNdjson({ type: "progress", ...ev }),
     });
+    programarPersistenciaSnapshotEnDrive(data);
     writeNdjson({ type: "done", payload: data });
     res.end();
   } catch (e) {

@@ -118,8 +118,16 @@ async function runSofficeConvertPdf(inputAbs: string, outDir: string): Promise<v
     const t = setTimeout(() => {
       child.kill("SIGKILL");
     }, timeoutMs());
-    child.on("error", (err) => {
+    child.on("error", (err: NodeJS.ErrnoException) => {
       clearTimeout(t);
+      if (err.code === "ENOENT") {
+        reject(
+          new Error(
+            "LibreOffice (`soffice`) no está instalado o no está en PATH. Define LIBREOFFICE_SOFFICE en .env.",
+          ),
+        );
+        return;
+      }
       reject(err);
     });
     child.on("close", (code) => {

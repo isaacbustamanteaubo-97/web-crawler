@@ -1,8 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import cron from "node-cron";
+import { vaciarAlmacenAnexosComprasmx } from "../services/anexoStorage.js";
 import { comprasmxOfficePdfCacheDir } from "../services/officePdfPreview.js";
-import { comprasmxAnexosBaseDir } from "../services/comprasmx.js";
+import { vaciarSnapshotsPersistidos } from "../services/snapshotPersistence.js";
 
 function hijoDentroDeBase(baseResuelto: string, nombreEntrada: string): string | null {
   const segmentos = path.normalize(nombreEntrada).split(path.sep).filter(Boolean);
@@ -33,12 +34,9 @@ async function vaciarContenidoDirectorioResuelto(base: string): Promise<{ elimin
   return { eliminados, base };
 }
 
-/**
- * Borra todo el contenido de la carpeta base de anexos (subcarpetas por expediente y archivos sueltos).
- * No elimina la carpeta raíz en sí.
- */
+/** Borra anexos (Google Drive bajo raíz configurada, o carpeta local `COMPRASMX_ANEXOS_DIR`). */
 export async function vaciarCarpetaAnexosComprasmx(): Promise<{ eliminados: number; base: string }> {
-  return vaciarContenidoDirectorioResuelto(path.resolve(comprasmxAnexosBaseDir()));
+  return vaciarAlmacenAnexosComprasmx();
 }
 
 /** Borra PDFs en caché generados por LibreOffice para vista previa (`COMPRASMX_OFFICE_PDF_CACHE_DIR` / tmp). */
@@ -73,6 +71,16 @@ export function iniciarLimpiezaNocturnaAnexos(): void {
           );
         } catch (err) {
           console.error("[comprasmx] Error limpiando anexos:", err);
+        }
+        try {
+          const snaps = await vaciarSnapshotsPersistidos();
+          if (snaps.eliminados > 0) {
+            console.log(
+              `[comprasmx] Limpieza nocturna snapshots JSON (Drive): ${snaps.eliminados} archivo(s) bajo ${snaps.base}`,
+            );
+          }
+        } catch (err) {
+          console.error("[comprasmx] Error limpiando snapshots en Drive:", err);
         }
         try {
           const pdf = await vaciarCachePdfLibreOffice();

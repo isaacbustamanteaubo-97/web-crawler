@@ -1,14 +1,10 @@
-import { createReadStream } from "node:fs";
 import path from "node:path";
 import archiver from "archiver";
 import { Document, HeadingLevel, Packer, Paragraph, TextRun } from "docx";
 import type { Response } from "express";
+import { crearReadStreamDocumento, resolverDocumentoComprasmx } from "./anexoStorage.js";
 import type { ComprasmxDetalleProcedimiento, ComprasmxFila } from "./comprasmx.js";
-import {
-  expedienteParaNombreCarpeta,
-  listarDocumentosLocalesComprasmx,
-  resolverDocumentoLocalComprasmx,
-} from "./comprasmx.js";
+import { expedienteParaNombreCarpeta, listarDocumentosLocalesComprasmx } from "./comprasmx.js";
 
 export type ExportLicitacionesInput = {
   filas: ComprasmxFila[];
@@ -213,9 +209,10 @@ export async function streamExportLicitacionesZip(input: ExportLicitacionesInput
       continue;
     }
     for (const d of listed.documentos) {
-      const meta = await resolverDocumentoLocalComprasmx(f.numeroIdentificacion, d.nombre);
+      const meta = await resolverDocumentoComprasmx(f.numeroIdentificacion, d.nombre);
       if (!meta) continue;
-      archive.append(createReadStream(meta.absolutePath), { name: path.posix.join(folder, d.nombre) });
+      const stream = await crearReadStreamDocumento(meta);
+      archive.append(stream, { name: path.posix.join(folder, d.nombre) });
     }
   }
 

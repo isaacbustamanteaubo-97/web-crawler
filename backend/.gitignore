@@ -1,6 +1,7 @@
 node_modules/
 dist/
 comprasmx-anexos/
+secrets/
 .env
 .env.local
 *.log

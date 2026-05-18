@@ -1,6 +1,21 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Download, type Locator, type Page } from "playwright";
+import {
+  almacenAnexosActivo,
+  carpetaTempDescargaAnexos,
+  comprasmxAnexosBaseDir,
+  expedienteParaNombreCarpeta,
+  listarDocumentosConUbicacion,
+  persistirAnexoDescargado,
+  resolverDocumentoComprasmx,
+} from "./anexoStorage.js";
+
+export {
+  carpetaAbsolutaAnexosPorNumeroIdentificacion,
+  comprasmxAnexosBaseDir,
+  expedienteParaNombreCarpeta,
+} from "./anexoStorage.js";
 
 const SOURCE_URL =
   "https://comprasmx.buengobierno.gob.mx/sitiopublico/#/";
@@ -82,6 +97,26 @@ function normEntidadNombre(s: string): string {
     .replace(/\s+/g, " ");
 }
 
+/** Misma normalización que entidades: minúsculas sin tildes para comparar palabras clave vs nombre del listado. */
+function normPalabraClave(s: string): string {
+  return normEntidadNombre(s);
+}
+
+function filaCoincidePalabrasClave(nombre: string, kws: string[]): boolean {
+  if (kws.length === 0) return true;
+  const n = normPalabraClave(nombre);
+  return kws.some((kw) => n.includes(kw));
+}
+
+function fusionarFilasUnicas(destino: ComprasmxFila[], batch: ComprasmxFila[], seen: Set<string>): void {
+  for (const f of batch) {
+    const key = f.numeroIdentificacion.trim() || f.nombre.trim();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    destino.push(f);
+  }
+}
+
 function mapEntidadesCanon(): Map<string, string> {
   const m = new Map<string, string>();
   for (const e of ENTIDADES_FEDERATIVAS_TODAS) {
@@ -151,8 +186,12 @@ export type ComprasmxAnexo = {
   titulo: string;
   /** Enlace directo si el DOM lo expone (poco frecuente en ANEXOS). */
   urlDescarga?: string;
-  /** Ruta absoluta tras hacer clic en el icono PrimeNG `pi-download` (Playwright `download.saveAs`). */
+  /** Ruta absoluta en disco local (solo almacenamiento local). */
   archivoLocal?: string;
+  /** ID de archivo en Google Drive (solo almacenamiento Drive). */
+  driveFileId?: string;
+  /** Nombre del archivo en almacenamiento (`01_convocatoria.pdf`). */
+  nombreArchivo?: string;
 };
 
 export type ComprasmxDetalleProcedimiento = {
@@ -209,6 +248,8 @@ export type ComprasmxSnapshot = {
   totalFilas: number;
   /** Total leído del texto "Total: N" bajo la tabla (null si no se detectó a tiempo). */
   totalEnPieDePortal: number | null;
+  /** Id en Google Drive si el snapshot se persistió en `_comprasmx_snapshots/`. */
+  snapshotPersistId?: string;
 };
 
 function sleep(ms: number): Promise<void> {
@@ -493,6 +534,55 @@ async function esperarRespuestaBusqueda(
   return { totalPie: await leerTotalPiePortal(page), sinResultados: false };
 }
 
+async function extraerFilasPaginaActualConReintentos(page: Page): Promise<ComprasmxFila[]> {
+  const maxRounds = fastMode() ? 5 : 8;
+  for (let r = 0; r < maxRounds; r++) {
+    const filas = await extraerFilasNumeroyNombre(page);
+    if (filas.length > 0) return filas;
+    await delay(200);
+  }
+  return [];
+}
+
+async function irPaginaSiguienteListado(page: Page): Promise<boolean> {
+  const next = page
+    .locator(
+      ".p-paginator-next:not(.p-disabled), .p-paginator .p-paginator-next:not(.p-disabled), button.p-paginator-next:not(.p-disabled)",
+    )
+    .first();
+  if (!(await next.isVisible().catch(() => false))) return false;
+  const disabled = await next.evaluate((el) => {
+    return el.classList.contains("p-disabled") || el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true";
+  }).catch(() => true);
+  if (disabled) return false;
+  await next.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+  await next.click({ timeout: 8000 }).catch(() => {});
+  return true;
+}
+
+async function esperarListadoTrasPaginar(page: Page, idPrimeraFilaAnterior: string): Promise<void> {
+  const loading = page.locator(".p-datatable-loading, .p-blockui").first();
+  if (await loading.isVisible().catch(() => false)) {
+    await loading.waitFor({ state: "hidden", timeout: 20_000 }).catch(() => {});
+  }
+  if (idPrimeraFilaAnterior) {
+    const timeout = fastMode() ? 12_000 : 20_000;
+    await page
+      .waitForFunction(
+        `(function(prev){
+          var trs = document.querySelectorAll("tbody tr");
+          if (!trs.length) return false;
+          var t = (trs[0].innerText || "").replace(/\\s+/g," ").trim();
+          return t.length > 0 && t.indexOf(prev) < 0;
+        })(${JSON.stringify(idPrimeraFilaAnterior)})`,
+        { timeout },
+      )
+      .catch(() => {});
+  }
+  await delay(fastMode() ? 60 : 120);
+}
+
+/** Recorre todas las páginas del paginador y fusiona filas (deduplicadas por número de identificación). */
 async function extraerFilasConReintentos(
   page: Page,
   totalEsperado: number | null,
@@ -500,24 +590,39 @@ async function extraerFilasConReintentos(
 ): Promise<ComprasmxFila[]> {
   if (sinResultados) return [];
   if (totalEsperado === 0) return [];
-  const maxRounds = fastMode() ? 5 : 8;
-  let filas: ComprasmxFila[] = [];
-  for (let r = 0; r < maxRounds; r++) {
-    filas = await extraerFilasNumeroyNombre(page);
-    if (totalEsperado !== null && totalEsperado > 0) {
-      if (filas.length >= totalEsperado) return filas.slice(0, totalEsperado);
-      if (filas.length > 0 && filas.length < totalEsperado) {
-        await delay(200);
-        continue;
-      }
+
+  const merged: ComprasmxFila[] = [];
+  const seen = new Set<string>();
+  const maxPages = 60;
+
+  for (let p = 0; p < maxPages; p++) {
+    const batch = await extraerFilasPaginaActualConReintentos(page);
+    if (batch.length === 0) break;
+
+    const antes = merged.length;
+    fusionarFilasUnicas(merged, batch, seen);
+
+    if (totalEsperado !== null && totalEsperado > 0 && merged.length >= totalEsperado) {
+      return merged.slice(0, totalEsperado);
     }
-    if (filas.length > 0) break;
-    await delay(200);
+
+    const idPrimera = batch[0]?.numeroIdentificacion?.trim() ?? "";
+    const haySiguiente = await irPaginaSiguienteListado(page);
+    if (!haySiguiente) break;
+
+    await esperarListadoTrasPaginar(page, idPrimera);
+
+    const tras = await extraerFilasNumeroyNombre(page);
+    const idTras = tras[0]?.numeroIdentificacion?.trim() ?? "";
+    if (idPrimera && idTras === idPrimera && merged.length === antes + batch.length) {
+      break;
+    }
   }
-  if (totalEsperado !== null && totalEsperado > 0 && filas.length > totalEsperado) {
-    return filas.slice(0, totalEsperado);
+
+  if (totalEsperado !== null && totalEsperado > 0 && merged.length > totalEsperado) {
+    return merged.slice(0, totalEsperado);
   }
-  return filas;
+  return merged;
 }
 
 async function leerValoresFechaPublicacionDom(page: Page): Promise<{ desde: string; hasta: string }> {
@@ -800,103 +905,33 @@ type RawDetalleProcedimiento = {
   anexos: Array<{ titulo: string; urlDescarga: string }>;
 };
 
-export function expedienteParaNombreCarpeta(id: string): string {
-  const s = id
-    .replace(/[^\p{L}\p{N}._-]+/gu, "_")
-    .replace(/_+/g, "_")
-    .slice(0, 120);
-  return s.length ? s : "sin-expediente";
-}
-
-/** Por defecto carpeta bajo `process.cwd()` para que los PDF aparezcan junto al proyecto al desarrollar. */
-export function comprasmxAnexosBaseDir(): string {
-  const fromEnv = process.env.COMPRASMX_ANEXOS_DIR?.trim();
-  if (fromEnv) return fromEnv;
-  return path.join(process.cwd(), "comprasmx-anexos");
-}
-
-/** Misma ruta que usa el crawler al guardar anexos (`expedienteParaNombreCarpeta` + `COMPRASMX_ANEXOS_DIR`). */
-export function carpetaAbsolutaAnexosPorNumeroIdentificacion(numeroIdentificacion: string): string {
-  const id = numeroIdentificacion.trim();
-  return path.join(comprasmxAnexosBaseDir(), expedienteParaNombreCarpeta(id));
-}
-
 export type ComprasmxDocumentoLocalInfo = {
   nombre: string;
   sizeBytes: number;
   modificadoIso: string;
 };
 
-function rutaArchivoDentroDeCarpetaSeguro(dirAbs: string, nombreArchivo: string): string | null {
-  const base = path.resolve(dirAbs);
-  const safeName = path.basename(nombreArchivo.trim());
-  if (!safeName || safeName.startsWith(".")) return null;
-  const target = path.resolve(base, safeName);
-  const rel = path.relative(base, target);
-  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
-  return target;
-}
-
-/** Lista archivos ya descargados para ese número de identificación (listado). */
+/** Lista archivos del expediente (disco local o Google Drive según configuración). */
 export async function listarDocumentosLocalesComprasmx(numeroIdentificacion: string): Promise<{
   numeroIdentificacion: string;
   carpetaEnDisco: string;
   total: number;
   documentos: ComprasmxDocumentoLocalInfo[];
 }> {
-  const id = numeroIdentificacion.trim();
-  if (!id) {
-    return { numeroIdentificacion: "", carpetaEnDisco: "", total: 0, documentos: [] };
-  }
-  const carpeta = carpetaAbsolutaAnexosPorNumeroIdentificacion(id);
-  let entries;
-  try {
-    entries = await fs.readdir(carpeta, { withFileTypes: true });
-  } catch (e: unknown) {
-    const code = e && typeof e === "object" && "code" in e ? String((e as NodeJS.ErrnoException).code) : "";
-    if (code === "ENOENT") {
-      return { numeroIdentificacion: id, carpetaEnDisco: carpeta, total: 0, documentos: [] };
-    }
-    throw e;
-  }
-  const documentos: ComprasmxDocumentoLocalInfo[] = [];
-  for (const ent of entries) {
-    if (!ent.isFile() || ent.name.startsWith(".")) continue;
-    const full = path.join(carpeta, ent.name);
-    const st = await fs.stat(full);
-    documentos.push({ nombre: ent.name, sizeBytes: st.size, modificadoIso: st.mtime.toISOString() });
-  }
-  documentos.sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
-  return { numeroIdentificacion: id, carpetaEnDisco: carpeta, total: documentos.length, documentos };
+  return listarDocumentosConUbicacion(numeroIdentificacion);
 }
 
-function mimePorNombreArchivo(nombre: string): string {
-  const ext = path.extname(nombre).toLowerCase();
-  if (ext === ".pdf") return "application/pdf";
-  if (ext === ".zip") return "application/zip";
-  if (ext === ".xml") return "application/xml";
-  if (ext === ".json") return "application/json";
-  if (ext === ".csv") return "text/csv";
-  return "application/octet-stream";
-}
-
-/** Resuelve un archivo bajo la carpeta del expediente; evita path traversal. */
+/** Resuelve un documento para servir o exportar (disco o Drive). */
 export async function resolverDocumentoLocalComprasmx(
   numeroIdentificacion: string,
   nombreArchivo: string,
 ): Promise<{ absolutePath: string; mime: string; sizeBytes: number } | null> {
-  const id = numeroIdentificacion.trim();
-  if (!id) return null;
-  const carpeta = carpetaAbsolutaAnexosPorNumeroIdentificacion(id);
-  const target = rutaArchivoDentroDeCarpetaSeguro(carpeta, nombreArchivo);
-  if (!target) return null;
-  try {
-    const st = await fs.stat(target);
-    if (!st.isFile()) return null;
-    return { absolutePath: target, mime: mimePorNombreArchivo(path.basename(target)), sizeBytes: st.size };
-  } catch {
-    return null;
+  const meta = await resolverDocumentoComprasmx(numeroIdentificacion, nombreArchivo);
+  if (!meta) return null;
+  if (meta.storage === "local" && meta.absolutePath) {
+    return { absolutePath: meta.absolutePath, mime: meta.mime, sizeBytes: meta.sizeBytes };
   }
+  return null;
 }
 
 /**
@@ -1076,9 +1111,11 @@ async function descargarAnexosPorIconosDescargar(
   });
 
   const out: ComprasmxAnexo[] = [];
-  const baseDir = comprasmxAnexosBaseDir();
-  const sessionDir = path.join(baseDir, expedienteParaNombreCarpeta(expedienteListadoId));
-  await fs.mkdir(sessionDir, { recursive: true });
+  const useDrive = almacenAnexosActivo() === "drive";
+  const sessionDir = useDrive
+    ? await carpetaTempDescargaAnexos(expedienteListadoId)
+    : path.join(comprasmxAnexosBaseDir(), expedienteParaNombreCarpeta(expedienteListadoId));
+  if (!useDrive) await fs.mkdir(sessionDir, { recursive: true });
 
   let saved = 0;
   for (let i = 0; i < iconCount && saved < max; i++) {
@@ -1113,7 +1150,21 @@ async function descargarAnexosPorIconosDescargar(
     const prefix = String(saved + 1).padStart(2, "0");
     const dest = await guardarArchivoTrasClicDescarga(page, clickTarget, sessionDir, prefix, perFileMs);
     if (dest) {
-      out.push({ titulo, archivoLocal: dest });
+      const nombreEnDisco = path.basename(dest);
+      const persisted = await persistirAnexoDescargado({
+        localPath: dest,
+        numeroIdentificacion: expedienteListadoId,
+        nombreEnDisco,
+      });
+      if (persisted.storage === "drive") {
+        out.push({
+          titulo,
+          driveFileId: persisted.driveFileId,
+          nombreArchivo: persisted.nombreArchivo,
+        });
+      } else {
+        out.push({ titulo, archivoLocal: persisted.archivoLocal, nombreArchivo: persisted.nombreArchivo });
+      }
       saved += 1;
     }
   }
@@ -1121,7 +1172,7 @@ async function descargarAnexosPorIconosDescargar(
   if (saved > 0) {
     emit?.({
       phase: "descarga",
-      message: `Anexos guardados en disco: ${saved} archivo(s).`,
+      message: `Anexos guardados (${useDrive ? "Google Drive" : "disco local"}): ${saved} archivo(s).`,
       numeroIdentificacion: expedienteListadoId,
     });
   }
@@ -1540,7 +1591,8 @@ export type FetchComprasmxOptions = {
    */
   entidadesFederativas?: string[];
   /**
-   * Si se envía, la respuesta solo incluye filas cuyo `nombre` contiene alguna palabra (sin distinguir mayúsculas).
+   * Si se envía, la respuesta solo incluye filas cuyo `nombre` contiene alguna palabra (sin distinguir mayúsculas ni tildes).
+   * El listado se recorre página por página hasta el total del portal antes de filtrar.
    * Por cada una (hasta el límite) se hace clic en el expediente en el listado, se lee el detalle en la pestaña nueva o en la misma ventana, y se vuelve al listado.
    */
   palabrasClave?: string[];
@@ -1825,7 +1877,7 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
     };
 
     const palabrasRespuesta = (opts?.palabrasClave ?? []).map((k) => k.trim()).filter(Boolean);
-    const kws = palabrasRespuesta.map((k) => k.toLowerCase());
+    const kws = palabrasRespuesta.map((k) => normPalabraClave(k)).filter(Boolean);
 
     avance(opts, {
       phase: "resultados",
@@ -1852,7 +1904,7 @@ async function ejecutarComprasmxSnapshot(opts?: FetchComprasmxOptions): Promise<
     }
 
     const lim = maxProcedimientoDetalle();
-    const coincidencias = filas.filter((f) => kws.some((kw) => f.nombre.toLowerCase().includes(kw)));
+    const coincidencias = filas.filter((f) => filaCoincidePalabrasClave(f.nombre, kws));
     const omitidos = Math.max(0, coincidencias.length - lim);
     const procesar = coincidencias.slice(0, lim);
 

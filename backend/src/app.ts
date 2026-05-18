@@ -39,7 +39,12 @@ export function buildApp() {
     _next: NextFunction,
   ) => {
     console.error(err);
-    res.status(500).json({ error: "Internal Server Error" });
+    const detail = err instanceof Error ? err.message : String(err);
+    const expose =
+      process.env.NODE_ENV !== "production" || process.env.COMPRASMX_EXPOSE_API_ERRORS === "1";
+    res.status(500).json({
+      error: expose && detail ? detail : "Internal Server Error",
+    });
   };
   app.use(onError);
 
