@@ -25,6 +25,10 @@ import {
 import { esFechaIsoValida, fechaIsoHoyMexico } from "@/lib/fecha-mexico";
 import { officeClienteTipo } from "@/lib/office-client-preview";
 import { DocumentoPreviewLoading } from "@/app/components/DocumentoPreviewLoading";
+import {
+  ExportacionPersonalizadaModal,
+  type DocumentoExportRow,
+} from "@/app/components/ExportacionPersonalizadaModal";
 import { OfficeClientPreview } from "@/app/components/OfficeClientPreview";
 
 type DetalleProcedimientoResumen = {
@@ -62,14 +66,6 @@ type SnapshotResponse = {
   snapshotPersistId?: string;
   source?: string;
   error?: string;
-};
-
-type SnapshotPersistedMeta = {
-  id: string;
-  savedAt: string;
-  serverFetchedAt?: string;
-  resumen: string;
-  totalFilas: number;
 };
 
 type DocumentoRow = {
@@ -269,12 +265,13 @@ export function ComprasmxPanel() {
 
   const [historialOpen, setHistorialOpen] = useState(false);
   const [historialLista, setHistorialLista] = useState<ComprasmxHistoryEntry[]>([]);
-  const [historialServidor, setHistorialServidor] = useState<SnapshotPersistedMeta[]>([]);
-  const [historialServidorError, setHistorialServidorError] = useState<string | null>(null);
-  const [cargandoHistorialServidor, setCargandoHistorialServidor] = useState(false);
 
   const [exportingAll, setExportingAll] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [exportPersonalizadoOpen, setExportPersonalizadoOpen] = useState(false);
+  const [exportHistorialDocs, setExportHistorialDocs] = useState<
+    Record<string, DocumentoExportRow[]> | undefined
+  >(undefined);
 
   useEffect(() => {
     let cancel = false;
@@ -569,52 +566,8 @@ export function ComprasmxPanel() {
 
   const abrirHistorial = useCallback(() => {
     setHistorialLista(listSnapshotHistory());
-    setHistorialServidor([]);
-    setHistorialServidorError(null);
     setHistorialOpen(true);
-    void (async () => {
-      setCargandoHistorialServidor(true);
-      try {
-        const r = await fetch(`${api}/snapshots`);
-        const parsed = await readComprasmxJsonResponse<{ snapshots?: SnapshotPersistedMeta[] }>(r);
-        if (!parsed.ok) {
-          setHistorialServidorError(parsed.error);
-          return;
-        }
-        setHistorialServidor(Array.isArray(parsed.data.snapshots) ? parsed.data.snapshots : []);
-      } catch (e) {
-        setHistorialServidorError(mensajeErrorConexionComprasmxApi(e, "generico"));
-      } finally {
-        setCargandoHistorialServidor(false);
-      }
-    })();
-  }, [api]);
-
-  const restaurarSnapshotDesdeDrive = useCallback(
-    async (serverId: string) => {
-      setSnapError(null);
-      try {
-        const r = await fetch(`${api}/snapshots/${encodeURIComponent(serverId)}`);
-        const parsed = await readComprasmxJsonResponse<{ payload?: SnapshotResponse; id?: string }>(r);
-        if (!parsed.ok) {
-          setSnapError(parsed.error);
-          return;
-        }
-        const record = parsed.data;
-        if (!record.payload) {
-          setSnapError("Respuesta del servidor sin datos de snapshot.");
-          return;
-        }
-        setSnapshot(record.payload);
-        const persisted = appendSnapshotHistoryEntry(record.payload, record.id ?? serverId);
-        activeHistoryEntryIdRef.current = persisted.ok ? persisted.id : null;
-        setHistorialOpen(false);
-      } catch (e) {
-        setSnapError(mensajeErrorConexionComprasmxApi(e, "generico"));
-      }
-    },
-    [api],
-  );
+  }, []);
 
   const aplicarEntradaHistorial = useCallback((id: string) => {
     const e = getHistoryEntry(id);
@@ -686,6 +639,13 @@ export function ComprasmxPanel() {
       setExportingAll(false);
     }
   }, [api, fechaISO, snapshot]);
+
+  const abrirExportacionPersonalizada = useCallback(() => {
+    const hid = activeHistoryEntryIdRef.current;
+    const entry = hid ? getHistoryEntry(hid) : null;
+    setExportHistorialDocs(entry?.documentosPorExpediente);
+    setExportPersonalizadoOpen(true);
+  }, []);
 
   const abrirDocumentos = useCallback(
     async (numeroIdentificacion: string) => {
@@ -938,57 +898,16 @@ export function ComprasmxPanel() {
                 Historial local
               </h2>
               <p className="mt-1 text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
-                Cada búsqueda exitosa se guarda en este navegador. Con Drive activo, el JSON se sube en segundo plano a{" "}
-                <strong>Google Drive</strong> (aparece abajo al abrir historial). Los documentos siguen en el API / Drive;
-                hace falta que el <strong>backend esté en marcha</strong> para listarlos o previsualizarlos.
+                Cada búsqueda exitosa se guarda en este navegador. Los documentos siguen en el API; hace falta que el{" "}
+                <strong>backend esté en marcha</strong> para listarlos o previsualizarlos.
               </p>
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-4">
-              {cargandoHistorialServidor ? (
-                <p className="mb-3 text-xs text-zinc-500">Sincronizando historial desde Drive…</p>
-              ) : null}
-              {historialServidorError ? (
-                <p className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">
-                  Drive: {historialServidorError}
-                </p>
-              ) : null}
-              {historialServidor.length > 0 ? (
-                <div className="mb-4">
-                  <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
-                    En Google Drive
-                  </h3>
-                  <ul className="flex flex-col gap-2">
-                    {historialServidor
-                      .filter((s) => !historialLista.some((h) => h.serverPersistId === s.id))
-                      .map((s) => (
-                        <li
-                          key={s.id}
-                          className="rounded-lg border border-sky-200 bg-sky-50/80 px-3 py-2.5 dark:border-sky-900 dark:bg-sky-950/30"
-                        >
-                          <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">{s.resumen}</p>
-                          <p className="mt-0.5 text-[11px] text-zinc-500">
-                            {new Date(s.savedAt).toLocaleString("es-MX", {
-                              dateStyle: "short",
-                              timeStyle: "short",
-                            })}
-                          </p>
-                          <button
-                            type="button"
-                            className="mt-2 rounded-md bg-sky-700 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-sky-800"
-                            onClick={() => void restaurarSnapshotDesdeDrive(s.id)}
-                          >
-                            Restaurar desde Drive
-                          </button>
-                        </li>
-                      ))}
-                  </ul>
-                </div>
-              ) : null}
-              {historialLista.length === 0 && historialServidor.length === 0 && !cargandoHistorialServidor ? (
+              {historialLista.length === 0 ? (
                 <p className="py-8 text-center text-sm text-zinc-500 dark:text-zinc-400">
                   Aún no hay snapshots guardados en este navegador. Ejecuta una búsqueda para crear el primero.
                 </p>
-              ) : historialLista.length === 0 ? null : (
+              ) : (
                 <ul className="flex flex-col gap-2">
                   {historialLista.map((row) => {
                     const nDocs = row.documentosPorExpediente
@@ -1245,14 +1164,24 @@ export function ComprasmxPanel() {
             <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
               Resultados ({snapshot.totalFilas ?? snapshot.filas?.length ?? 0})
             </h2>
-            <button
-              type="button"
-              disabled={exportingAll || (snapshot.filas?.length ?? 0) === 0}
-              onClick={() => void exportarTodasLicitaciones()}
-              className="shrink-0 rounded-lg border border-emerald-700 bg-white px-4 py-2 text-sm font-semibold text-emerald-800 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-500 dark:bg-zinc-950 dark:text-emerald-300 dark:hover:bg-emerald-950/40"
-            >
-              {exportingAll ? "Generando ZIP…" : "Exportar todo (ZIP + Word)"}
-            </button>
+            <div className="flex shrink-0 flex-wrap gap-2">
+              <button
+                type="button"
+                disabled={(snapshot.filas?.length ?? 0) === 0}
+                onClick={abrirExportacionPersonalizada}
+                className="rounded-lg border border-violet-600 bg-violet-50 px-4 py-2 text-sm font-semibold text-violet-900 hover:bg-violet-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-violet-500 dark:bg-violet-950/40 dark:text-violet-200 dark:hover:bg-violet-900/50"
+              >
+                Exportación personalizada…
+              </button>
+              <button
+                type="button"
+                disabled={exportingAll || (snapshot.filas?.length ?? 0) === 0}
+                onClick={() => void exportarTodasLicitaciones()}
+                className="rounded-lg border border-emerald-700 bg-white px-4 py-2 text-sm font-semibold text-emerald-800 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-emerald-500 dark:bg-zinc-950 dark:text-emerald-300 dark:hover:bg-emerald-950/40"
+              >
+                {exportingAll ? "Generando ZIP…" : "Exportar todo (ZIP + Word)"}
+              </button>
+            </div>
           </div>
           {exportError ? (
             <p className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
@@ -1461,6 +1390,17 @@ export function ComprasmxPanel() {
             </div>
           </div>
         </div>
+      ) : null}
+
+      {exportPersonalizadoOpen && snapshot ? (
+        <ExportacionPersonalizadaModal
+          open={exportPersonalizadoOpen}
+          onClose={() => setExportPersonalizadoOpen(false)}
+          filas={snapshot.filas ?? []}
+          fetchedAt={snapshot.fetchedAt}
+          filtros={snapshot.filtros}
+          documentosHistorial={exportHistorialDocs}
+        />
       ) : null}
     </div>
   );

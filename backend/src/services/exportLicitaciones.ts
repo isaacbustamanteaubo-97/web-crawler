@@ -10,6 +10,8 @@ export type ExportLicitacionesInput = {
   filas: ComprasmxFila[];
   fetchedAt?: string;
   filtros?: Record<string, unknown>;
+  /** Si se envía, solo se incluyen estos nombres de archivo por expediente (clave = numeroIdentificacion). */
+  documentosPorExpediente?: Record<string, string[]>;
 };
 
 const EXPORT_MAX_FILAS = Math.min(
@@ -126,9 +128,18 @@ async function buildResumenDocx(input: ExportLicitacionesInput, docCounts: Map<s
     new Paragraph({ spacing: { after: 240 }, children: [] }),
   );
 
+  const nombresSeleccionados = input.documentosPorExpediente ?? {};
+
   for (let i = 0; i < input.filas.length; i++) {
     const f = input.filas[i]!;
     const nDocs = docCounts.get(f.numeroIdentificacion) ?? 0;
+    const listaSel = nombresSeleccionados[f.numeroIdentificacion];
+    const detalleDocs =
+      listaSel && listaSel.length > 0
+        ? `${nDocs} archivo(s) seleccionado(s): ${listaSel.join(", ")}`
+        : nDocs > 0
+          ? `${nDocs} archivo(s) en carpeta «${expedienteParaNombreCarpeta(f.numeroIdentificacion)}»`
+          : "Sin archivos en esta exportación";
     children.push(
       new Paragraph({
         heading: HeadingLevel.HEADING_1,
@@ -136,12 +147,7 @@ async function buildResumenDocx(input: ExportLicitacionesInput, docCounts: Map<s
         children: [new TextRun({ text: `${i + 1}. ${f.numeroIdentificacion}`, bold: true })],
       }),
       parrafoEtiqueta("Nombre en listado", textoO(f.nombre)),
-      parrafoEtiqueta(
-        "Documentos en ZIP",
-        nDocs > 0
-          ? `${nDocs} archivo(s) en carpeta «${expedienteParaNombreCarpeta(f.numeroIdentificacion)}»`
-          : "Sin archivos descargados en el servidor",
-      ),
+      parrafoEtiqueta("Documentos en ZIP", detalleDocs),
     );
     if (f.detalleProcedimiento) children.push(...seccionDetalle(f.detalleProcedimiento));
     children.push(new Paragraph({ spacing: { after: 200 }, children: [] }));
@@ -158,13 +164,24 @@ function nombreZipExport(fetchedAt?: string): string {
   return `comprasmx-export-${stamp}.zip`.replace(/"/g, "");
 }
 
+function documentosAExportar(
+  listado: { documentos: { nombre: string }[] },
+  seleccion?: string[],
+): { nombre: string }[] {
+  if (!seleccion || seleccion.length === 0) return listado.documentos;
+  const permitidos = new Set(seleccion);
+  return listado.documentos.filter((d) => permitidos.has(d.nombre));
+}
+
 export async function streamExportLicitacionesZip(input: ExportLicitacionesInput, res: Response): Promise<void> {
   const filas = input.filas.slice(0, EXPORT_MAX_FILAS);
   const docCounts = new Map<string, number>();
+  const seleccionGlobal = input.documentosPorExpediente ?? {};
 
   for (const f of filas) {
     const listed = await listarDocumentosLocalesComprasmx(f.numeroIdentificacion);
-    docCounts.set(f.numeroIdentificacion, listed.total);
+    const elegidos = documentosAExportar(listed, seleccionGlobal[f.numeroIdentificacion]);
+    docCounts.set(f.numeroIdentificacion, elegidos.length);
   }
 
   const docxBuf = await buildResumenDocx({ ...input, filas }, docCounts);
@@ -176,9 +193,17 @@ export async function streamExportLicitacionesZip(input: ExportLicitacionesInput
         filtros: input.filtros ?? null,
         totalLicitaciones: filas.length,
         filas,
-        documentosPorExpediente: Object.fromEntries(
-          filas.map((f) => [f.numeroIdentificacion, docCounts.get(f.numeroIdentificacion) ?? 0]),
-        ),
+        documentosPorExpediente: await (async () => {
+          const map: Record<string, string[]> = {};
+          for (const f of filas) {
+            const listed = await listarDocumentosLocalesComprasmx(f.numeroIdentificacion);
+            map[f.numeroIdentificacion] = documentosAExportar(
+              listed,
+              seleccionGlobal[f.numeroIdentificacion],
+            ).map((d) => d.nombre);
+          }
+          return map;
+        })(),
       },
       null,
       2,
@@ -201,14 +226,15 @@ export async function streamExportLicitacionesZip(input: ExportLicitacionesInput
   for (const f of filas) {
     const folder = expedienteParaNombreCarpeta(f.numeroIdentificacion);
     const listed = await listarDocumentosLocalesComprasmx(f.numeroIdentificacion);
-    if (listed.total === 0) {
+    const aIncluir = documentosAExportar(listed, seleccionGlobal[f.numeroIdentificacion]);
+    if (aIncluir.length === 0) {
       archive.append(
-        `No hay archivos locales para ${f.numeroIdentificacion}. Ejecuta un snapshot con palabras clave para descargar anexos.\n`,
+        `No hay archivos seleccionados para ${f.numeroIdentificacion}.\n`,
         { name: path.posix.join(folder, "LEEME_sin_documentos.txt") },
       );
       continue;
     }
-    for (const d of listed.documentos) {
+    for (const d of aIncluir) {
       const meta = await resolverDocumentoComprasmx(f.numeroIdentificacion, d.nombre);
       if (!meta) continue;
       const stream = await crearReadStreamDocumento(meta);
@@ -217,6 +243,52 @@ export async function streamExportLicitacionesZip(input: ExportLicitacionesInput
   }
 
   await archive.finalize();
+}
+
+function parseDocumentosPorExpediente(raw: unknown): Record<string, string[]> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const out: Record<string, string[]> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const id = k.trim();
+    if (!id || !Array.isArray(v)) continue;
+    const names = v
+      .map((x) => (typeof x === "string" ? x.trim() : ""))
+      .filter(Boolean);
+    if (names.length > 0) out[id] = names;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+export function parseExportRequestBody(
+  body: unknown,
+): { ok: true; input: ExportLicitacionesInput } | { ok: false; error: string } {
+  const filasParsed = parseFilasExportBody(body);
+  if (!filasParsed.ok) return filasParsed;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { ok: false, error: "Body JSON inválido." };
+  }
+  const rec = body as Record<string, unknown>;
+  const fetchedAt = typeof rec.fetchedAt === "string" ? rec.fetchedAt : undefined;
+  const filtros =
+    rec.filtros && typeof rec.filtros === "object" && !Array.isArray(rec.filtros)
+      ? (rec.filtros as Record<string, unknown>)
+      : undefined;
+  const documentosPorExpediente = parseDocumentosPorExpediente(rec.documentosPorExpediente);
+  if (documentosPorExpediente) {
+    for (const f of filasParsed.filas) {
+      const sel = documentosPorExpediente[f.numeroIdentificacion];
+      if (!sel || sel.length === 0) {
+        return {
+          ok: false,
+          error: `documentosPorExpediente: el expediente ${f.numeroIdentificacion} no tiene archivos seleccionados.`,
+        };
+      }
+    }
+  }
+  return {
+    ok: true,
+    input: { filas: filasParsed.filas, fetchedAt, filtros, documentosPorExpediente },
+  };
 }
 
 export function parseFilasExportBody(body: unknown): { ok: true; filas: ComprasmxFila[] } | { ok: false; error: string } {

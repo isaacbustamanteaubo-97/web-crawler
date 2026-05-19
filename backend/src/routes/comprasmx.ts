@@ -26,7 +26,7 @@ import {
   snapshotsPersistenceAvailable,
 } from "../services/snapshotPersistence.js";
 import {
-  parseFilasExportBody,
+  parseExportRequestBody,
   streamExportLicitacionesZip,
 } from "../services/exportLicitaciones.js";
 import { verifyArchivoViewerToken } from "../services/archivoViewerToken.js";
@@ -539,18 +539,12 @@ comprasmxRouter.get("/documentos/archivo", async (req: Request, res: Response, n
 
 comprasmxRouter.post("/export", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const parsed = parseFilasExportBody(req.body);
+    const parsed = parseExportRequestBody(req.body);
     if (!parsed.ok) {
       res.status(400).json({ error: parsed.error });
       return;
     }
-    const body = requestBodyRecord(req);
-    const fetchedAt = typeof body.fetchedAt === "string" ? body.fetchedAt : undefined;
-    const filtros =
-      body.filtros && typeof body.filtros === "object" && !Array.isArray(body.filtros)
-        ? (body.filtros as Record<string, unknown>)
-        : undefined;
-    await streamExportLicitacionesZip({ filas: parsed.filas, fetchedAt, filtros }, res);
+    await streamExportLicitacionesZip(parsed.input, res);
   } catch (err) {
     next(err);
   }
