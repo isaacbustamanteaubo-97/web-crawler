@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { DocumentoPreviewLoading } from "@/app/components/DocumentoPreviewLoading";
 import { etiquetaOfficeCliente, type OfficeClienteTipo } from "@/lib/office-client-preview";
-import { mensajeErrorConexionComprasmxApi } from "@/lib/comprasmx-api";
+import { resolverErrorComprasmxUsuario, type ComprasmxUiError } from "@/lib/comprasmx-servicio";
+import { ComprasmxErrorAviso } from "@/app/components/ComprasmxErrorAviso";
 
 const DOCX_ZOOM_MIN = 0.5;
 const DOCX_ZOOM_MAX = 2;
@@ -27,7 +28,7 @@ export function OfficeClientPreview({ nombre, url, tipo }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ComprasmxUiError | null>(null);
   const [docxZoom, setDocxZoom] = useState(1);
 
   const acercarDocx = useCallback(() => {
@@ -84,7 +85,7 @@ export function OfficeClientPreview({ nombre, url, tipo }: Props) {
         }
       } catch (e) {
         if (ac.signal.aborted) return;
-        setError(mensajeErrorConexionComprasmxApi(e, "pdf"));
+        setError(resolverErrorComprasmxUsuario({ err: e }, "pdf"));
       } finally {
         if (!ac.signal.aborted) setLoading(false);
       }
@@ -154,16 +155,18 @@ export function OfficeClientPreview({ nombre, url, tipo }: Props) {
           />
         ) : null}
       {error ? (
-        <div className="flex flex-1 flex-col gap-3 p-4 text-sm text-red-700 dark:text-red-300">
-          <p>No se pudo generar la vista previa: {error}</p>
-          <a
-            href={url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex w-fit rounded-lg bg-zinc-900 px-3 py-2 text-white dark:bg-zinc-100 dark:text-zinc-900"
-          >
-            Descargar archivo
-          </a>
+        <div className="flex flex-1 flex-col gap-3 p-4">
+          <ComprasmxErrorAviso error={error} />
+          {!error.servicioNoDisponible ? (
+            <a
+              href={url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex w-fit rounded-lg bg-zinc-900 px-3 py-2 text-sm text-white dark:bg-zinc-100 dark:text-zinc-900"
+            >
+              Descargar archivo
+            </a>
+          ) : null}
         </div>
       ) : null}
         <div

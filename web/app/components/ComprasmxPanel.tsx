@@ -3,10 +3,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import {
   comprasmxApiBase,
-  mensajeErrorConexionComprasmxApi,
+  errorUiDesdeJson,
+  fetchComprasmxConTimeout,
   proxiedComprasmxUrl,
   readComprasmxJsonResponse,
 } from "@/lib/comprasmx-api";
+import {
+  COMPRASMX_STREAM_CONEXION_INICIAL_MS,
+  COMPRASMX_STREAM_SIN_AVANCE_MS,
+  esErrorStallStream,
+  leerStreamConLimiteInactividad,
+} from "@/lib/comprasmx-stream";
+import {
+  errorValidacionComprasmx,
+  LEYENDA_SERVICIO_NO_DISPONIBLE,
+  resolverErrorComprasmxUsuario,
+  TITULO_SERVICIO_NO_DISPONIBLE,
+  type ComprasmxUiError,
+} from "@/lib/comprasmx-servicio";
+import { ComprasmxErrorAviso } from "@/app/components/ComprasmxErrorAviso";
 import {
   appendSnapshotHistoryEntry,
   clearSnapshotHistory,
@@ -227,12 +242,13 @@ export function ComprasmxPanel() {
   const [headed, setHeaded] = useState(false);
 
   const [loadingSnap, setLoadingSnap] = useState(false);
-  const [snapError, setSnapError] = useState<string | null>(null);
+  const [snapError, setSnapError] = useState<ComprasmxUiError | null>(null);
+  const [apiServicioCaido, setApiServicioCaido] = useState(false);
   const [snapshot, setSnapshot] = useState<SnapshotResponse | null>(null);
 
   const [docModal, setDocModal] = useState<string | null>(null);
   const [docs, setDocs] = useState<DocumentoRow[]>([]);
-  const [docsError, setDocsError] = useState<string | null>(null);
+  const [docsError, setDocsError] = useState<ComprasmxUiError | null>(null);
   const [loadingDocs, setLoadingDocs] = useState(false);
   const [preview, setPreview] = useState<{
     nombre: string;
@@ -266,7 +282,7 @@ export function ComprasmxPanel() {
   const [historialLista, setHistorialLista] = useState<ComprasmxHistoryEntry[]>([]);
 
   const [exportingAll, setExportingAll] = useState(false);
-  const [exportError, setExportError] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<ComprasmxUiError | null>(null);
   const [exportPersonalizadoOpen, setExportPersonalizadoOpen] = useState(false);
   const [exportHistorialDocs, setExportHistorialDocs] = useState<
     Record<string, DocumentoExportRow[]> | undefined
@@ -278,10 +294,15 @@ export function ComprasmxPanel() {
       try {
         const r = await fetch(`${api}/entidades`);
         const parsed = await readComprasmxJsonResponse<{ entidades?: string[] }>(r);
-        if (!parsed.ok || cancel) return;
+        if (!parsed.ok || cancel) {
+          if (!parsed.ok && !cancel) setApiServicioCaido(true);
+          return;
+        }
         if (!Array.isArray(parsed.data.entidades) || parsed.data.entidades.length === 0) return;
         setEntidadesLista(parsed.data.entidades);
+        setApiServicioCaido(false);
       } catch {
+        if (!cancel) setApiServicioCaido(true);
         /* fallback ENTIDADES_TODAS_FALLBACK */
       }
     })();
@@ -313,7 +334,7 @@ export function ComprasmxPanel() {
     setProgresoOverlay({ tipo: "descarga-zip", expediente, archivosCount: docs.length });
     setDocsError(null);
     try {
-      const r = await fetch(docZipHref);
+      const r = await fetchComprasmxConTimeout(docZipHref, undefined, 300_000);
       if (!r.ok) {
         let msg = `No se pudo descargar el ZIP (${r.status})`;
         try {
@@ -322,7 +343,8 @@ export function ComprasmxPanel() {
         } catch {
           /* ignore */
         }
-        throw new Error(msg);
+        setDocsError(resolverErrorComprasmxUsuario({ status: r.status, error: msg }, "descarga"));
+        return;
       }
       const blob = await r.blob();
       const disp = r.headers.get("Content-Disposition") ?? "";
@@ -338,7 +360,7 @@ export function ComprasmxPanel() {
       a.remove();
       URL.revokeObjectURL(url);
     } catch (e) {
-      setDocsError(mensajeErrorConexionComprasmxApi(e, "generico"));
+      setDocsError(resolverErrorComprasmxUsuario({ err: e, sinRespuesta: esErrorStallStream(e) }, "descarga"));
     } finally {
       setDownloadingZip(false);
       setProgresoOverlay(null);
@@ -425,16 +447,16 @@ export function ComprasmxPanel() {
 
     const entidadesFederativas = [...entSel].sort((a, b) => a.localeCompare(b, "es"));
     if (entidadesFederativas.length === 0) {
-      setSnapError("Selecciona al menos una entidad federativa antes de buscar.");
+      setSnapError(errorValidacionComprasmx("Selecciona al menos una entidad federativa antes de buscar."));
       return;
     }
     if (!esFechaIsoValida(fechaISO.trim())) {
-      setSnapError("Indica una fecha de publicación válida (YYYY-MM-DD) antes de buscar.");
+      setSnapError(errorValidacionComprasmx("Indica una fecha de publicación válida (YYYY-MM-DD) antes de buscar."));
       return;
     }
     const palabrasClave = palabrasClavePayload();
     if (palabrasClave.length === 0) {
-      setSnapError("Escribe al menos una palabra clave (una por línea) antes de buscar.");
+      setSnapError(errorValidacionComprasmx("Agrega al menos una palabra clave antes de buscar."));
       return;
     }
 
@@ -484,17 +506,25 @@ export function ComprasmxPanel() {
         } catch {
           if (t.trim()) msg = t.slice(0, 400);
         }
-        setSnapError(msg);
-        setSnapshotProgressLog((prev) => [...prev, { phase: "error", message: msg, at: hora() }]);
+        const uiErr = resolverErrorComprasmxUsuario({ status: r.status, error: msg }, "busqueda");
+        setSnapError(uiErr);
+        setSnapshotProgressLog((prev) => [
+          ...prev,
+          {
+            phase: "error",
+            message: uiErr.servicioNoDisponible ? TITULO_SERVICIO_NO_DISPONIBLE : uiErr.mensaje,
+            at: hora(),
+          },
+        ]);
         setSnapshotStreamDone(true);
         return;
       }
 
       const reader = r.body?.getReader();
       if (!reader) {
-        const msg = "El navegador no permitió leer la respuesta en streaming.";
-        setSnapError(msg);
-        setSnapshotProgressLog((prev) => [...prev, { phase: "error", message: msg, at: hora() }]);
+        const uiErr = errorValidacionComprasmx("El navegador no permitió leer la respuesta en streaming.");
+        setSnapError(uiErr);
+        setSnapshotProgressLog((prev) => [...prev, { phase: "error", message: uiErr.mensaje, at: hora() }]);
         setSnapshotStreamDone(true);
         return;
       }
@@ -502,9 +532,13 @@ export function ComprasmxPanel() {
       const dec = new TextDecoder();
       let streamFinishedWithDone = false;
       let streamHadTerminalError = false;
+      let recibioEventoStream = false;
+      const lastStreamEventAtRef = { current: Date.now() };
 
       const handleObject = (obj: unknown) => {
         if (!obj || typeof obj !== "object") return;
+        lastStreamEventAtRef.current = Date.now();
+        recibioEventoStream = true;
         const o = obj as Record<string, unknown>;
         if (o.type === "progress") {
           const phase = o.phase;
@@ -550,27 +584,50 @@ export function ComprasmxPanel() {
           const message = o.message;
           if (typeof message === "string") {
             streamHadTerminalError = true;
-            setSnapError(message);
+            const uiErr = resolverErrorComprasmxUsuario({ error: message }, "busqueda");
+            setSnapError(uiErr);
             setSnapshotProgressLog((prev) => [
               ...prev,
-              { phase: "error", message, at: hora() } satisfies SnapshotProgressLine,
+              {
+                phase: "error",
+                message: uiErr.servicioNoDisponible ? TITULO_SERVICIO_NO_DISPONIBLE : uiErr.mensaje,
+                at: hora(),
+              } satisfies SnapshotProgressLine,
             ]);
             setSnapshotStreamDone(true);
           }
         }
       };
 
-      while (true) {
-        const { done, value } = await reader.read();
-        appendNdjsonChunk(dec.decode(value ?? new Uint8Array(), { stream: !done }), buf, handleObject);
-        if (done) break;
+      try {
+        while (true) {
+          const inactivityMs = recibioEventoStream
+            ? COMPRASMX_STREAM_SIN_AVANCE_MS
+            : COMPRASMX_STREAM_CONEXION_INICIAL_MS;
+          const { done, value } = await leerStreamConLimiteInactividad(reader, {
+            inactivityMs,
+            getLastEventAt: () => lastStreamEventAtRef.current,
+            signal: ac.signal,
+          });
+          appendNdjsonChunk(dec.decode(value ?? new Uint8Array(), { stream: !done }), buf, handleObject);
+          if (done) break;
+        }
+        appendNdjsonChunk(dec.decode(), buf, handleObject);
+      } catch (streamErr) {
+        await reader.cancel().catch(() => {});
+        throw streamErr;
       }
-      appendNdjsonChunk(dec.decode(), buf, handleObject);
 
       if (!streamFinishedWithDone && !streamHadTerminalError) {
-        const msg = "La respuesta terminó sin datos de resultado. Revisa el servidor.";
-        setSnapError(msg);
-        setSnapshotProgressLog((prev) => [...prev, { phase: "error", message: msg, at: hora() }]);
+        const uiErr = resolverErrorComprasmxUsuario(
+          { error: "La respuesta terminó sin datos de resultado.", servicioNoDisponible: true },
+          "busqueda",
+        );
+        setSnapError(uiErr);
+        setSnapshotProgressLog((prev) => [
+          ...prev,
+          { phase: "error", message: TITULO_SERVICIO_NO_DISPONIBLE, at: hora() },
+        ]);
         setSnapshotStreamDone(true);
       }
     } catch (e) {
@@ -579,9 +636,19 @@ export function ComprasmxPanel() {
         setSnapshotStreamDone(true);
         return;
       }
-      const msg = e instanceof Error ? e.message : String(e);
-      setSnapError(msg);
-      setSnapshotProgressLog((prev) => [...prev, { phase: "error", message: msg, at: hora() }]);
+      const uiErr = resolverErrorComprasmxUsuario(
+        { err: e, sinRespuesta: esErrorStallStream(e) },
+        "busqueda",
+      );
+      setSnapError(uiErr);
+      setSnapshotProgressLog((prev) => [
+        ...prev,
+        {
+          phase: "error",
+          message: uiErr.servicioNoDisponible ? TITULO_SERVICIO_NO_DISPONIBLE : uiErr.mensaje,
+          at: hora(),
+        },
+      ]);
       setSnapshotStreamDone(true);
     } finally {
       setLoadingSnap(false);
@@ -635,15 +702,19 @@ export function ComprasmxPanel() {
     setExportingAll(true);
     setExportError(null);
     try {
-      const r = await fetch(`${api}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          filas,
-          fetchedAt: snapshot?.fetchedAt,
-          filtros: snapshot?.filtros,
-        }),
-      });
+      const r = await fetchComprasmxConTimeout(
+        `${api}/export`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            filas,
+            fetchedAt: snapshot?.fetchedAt,
+            filtros: snapshot?.filtros,
+          }),
+        },
+        1_800_000,
+      );
       if (!r.ok) {
         let msg = `Exportación falló (${r.status})`;
         try {
@@ -652,7 +723,8 @@ export function ComprasmxPanel() {
         } catch {
           /* ignore */
         }
-        throw new Error(msg);
+        setExportError(resolverErrorComprasmxUsuario({ status: r.status, error: msg }, "exportacion"));
+        return;
       }
       const blob = await r.blob();
       const disp = r.headers.get("Content-Disposition") ?? "";
@@ -668,7 +740,7 @@ export function ComprasmxPanel() {
       a.remove();
       URL.revokeObjectURL(url);
     } catch (e) {
-      setExportError(mensajeErrorConexionComprasmxApi(e, "generico"));
+      setExportError(resolverErrorComprasmxUsuario({ err: e, sinRespuesta: esErrorStallStream(e) }, "exportacion"));
     } finally {
       setExportingAll(false);
     }
@@ -710,7 +782,7 @@ export function ComprasmxPanel() {
         const r = await fetch(`${api}/documentos?${new URLSearchParams({ numeroIdentificacion: idTrim }).toString()}`);
         const parsed = await readComprasmxJsonResponse<DocumentosResponse>(r);
         if (!parsed.ok) {
-          setDocsError(parsed.error);
+          setDocsError(errorUiDesdeJson(parsed, "documentos"));
           return;
         }
         const j = parsed.data;
@@ -732,7 +804,7 @@ export function ComprasmxPanel() {
         setDocs(mapped);
         mergeDocumentosIntoHistoryEntry(activeHistoryEntryIdRef.current, idTrim, mapped);
       } catch (e) {
-        setDocsError(mensajeErrorConexionComprasmxApi(e, "documentos"));
+        setDocsError(resolverErrorComprasmxUsuario({ err: e }, "documentos"));
       } finally {
         setLoadingDocs(false);
       }
@@ -797,6 +869,15 @@ export function ComprasmxPanel() {
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-8 px-4 py-10 sm:px-6">
+      {apiServicioCaido ? (
+        <ComprasmxErrorAviso
+          error={{
+            servicioNoDisponible: true,
+            mensaje: LEYENDA_SERVICIO_NO_DISPONIBLE,
+            detalle: "No se pudo contactar al API al cargar la página. Revisa que el backend esté en marcha.",
+          }}
+        />
+      ) : null}
       {snapshotProgressOpen ? (
         <div
           className="fixed inset-0 z-[60] flex items-center justify-center bg-black/55 p-3 sm:p-6"
@@ -808,10 +889,16 @@ export function ComprasmxPanel() {
           <div className="flex max-h-[min(90dvh,720px)] w-full max-w-lg flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-950">
             <div className="shrink-0 border-b border-zinc-200 px-4 py-3 dark:border-zinc-800 sm:px-5">
               <h2 id="snapshot-progress-title" className="text-base font-semibold text-zinc-900 dark:text-zinc-50">
-                Consulta en curso
+                {snapError?.servicioNoDisponible
+                  ? "Servicio interrumpido"
+                  : snapshotStreamDone && snapError
+                    ? "Consulta con error"
+                    : "Consulta en curso"}
               </h2>
               <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
-                El servidor envía cada paso mientras obtiene datos de Compras MX.
+                {snapError?.servicioNoDisponible
+                  ? "El servidor dejó de responder. Revisa el aviso abajo e intenta más tarde."
+                  : "El servidor envía cada paso mientras obtiene datos de Compras MX."}
               </p>
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-4">
@@ -826,6 +913,7 @@ export function ComprasmxPanel() {
                     const ok = row.phase === "fin";
                     const cancel = row.phase === "cancelado";
                     const descarga = row.phase === "descarga";
+                    const drive = row.phase === "drive";
                     return (
                       <li
                         key={`${row.at}-${i}-${row.phase}-${row.detalle ?? row.message}`}
@@ -836,16 +924,20 @@ export function ComprasmxPanel() {
                               ? "border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-100"
                               : cancel
                                 ? "border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100"
-                                : descarga
-                                  ? "border-sky-200 bg-sky-50 text-sky-950 dark:border-sky-800 dark:bg-sky-950/35 dark:text-sky-100"
-                                  : "border-zinc-200 bg-zinc-50 text-zinc-800 dark:border-zinc-700 dark:bg-zinc-900/50 dark:text-zinc-200"
+                                : drive
+                                  ? "border-violet-200 bg-violet-50 text-violet-950 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-100"
+                                  : descarga
+                                    ? "border-sky-200 bg-sky-50 text-sky-950 dark:border-sky-800 dark:bg-sky-950/35 dark:text-sky-100"
+                                    : "border-zinc-200 bg-zinc-50 text-zinc-800 dark:border-zinc-700 dark:bg-zinc-900/50 dark:text-zinc-200"
                         }`}
                       >
                         <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5">
                           <span className="font-mono text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
                             {row.at}
                           </span>
-                          <span className="font-mono text-[10px] text-zinc-500 dark:text-zinc-400">{row.phase}</span>
+                          <span className="font-mono text-[10px] text-zinc-500 dark:text-zinc-400">
+                            {row.phase === "drive" ? "Google Drive" : row.phase}
+                          </span>
                         </div>
                         <p className="mt-1 leading-snug">{row.message}</p>
                         {row.detalle ? (
@@ -869,7 +961,8 @@ export function ComprasmxPanel() {
                   {formatoDuracionSegundos(snapshotElapsedSec)}
                 </span>
               </div>
-              {loadingSnap && !snapshotStreamDone ? (
+              {snapError ? <ComprasmxErrorAviso error={snapError} /> : null}
+              {loadingSnap && !snapshotStreamDone && !snapError ? (
                 <div className="space-y-2">
                   <div
                     className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800"
@@ -911,9 +1004,9 @@ export function ComprasmxPanel() {
                 type="button"
                 className="rounded-lg bg-emerald-700 px-3 py-2 text-sm font-semibold text-white hover:bg-emerald-800 disabled:opacity-50"
                 onClick={() => cerrarProgresoSnapshot()}
-                disabled={loadingSnap && !snapshotStreamDone}
+                disabled={loadingSnap && !snapshotStreamDone && !snapError}
               >
-                {loadingSnap && !snapshotStreamDone ? "Espera…" : "Cerrar"}
+                {loadingSnap && !snapshotStreamDone && !snapError ? "Espera…" : "Cerrar"}
               </button>
             </div>
           </div>
@@ -1169,11 +1262,7 @@ export function ComprasmxPanel() {
           </p>
         ) : null}
 
-        {snapError ? (
-          <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
-            {snapError}
-          </p>
-        ) : null}
+        <ComprasmxErrorAviso error={snapError} />
       </section>
 
       {snapshot ? (
@@ -1201,11 +1290,7 @@ export function ComprasmxPanel() {
               </button>
             </div>
           </div>
-          {exportError ? (
-            <p className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
-              {exportError}
-            </p>
-          ) : null}
+          <ComprasmxErrorAviso error={exportError} className="mt-3" />
           {resumenFiltrosSnapshot(snapshot) ? (
             <p className="mt-3 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-xs text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900/50 dark:text-zinc-300">
               <span className="font-medium text-zinc-900 dark:text-zinc-100">Filtros aplicados en esta consulta:</span>{" "}
@@ -1293,7 +1378,7 @@ export function ComprasmxPanel() {
               <div className="flex max-h-[40vh] min-h-0 flex-col overflow-hidden border-b border-zinc-200 dark:border-zinc-800 md:max-h-none md:border-b-0 md:border-r">
                 <div className="min-h-0 flex-1 overflow-y-auto p-3 sm:p-4">
                   {loadingDocs ? <p className="text-sm text-zinc-500">Cargando…</p> : null}
-                  {docsError ? <p className="text-sm text-red-600">{docsError}</p> : null}
+                  <ComprasmxErrorAviso error={docsError} />
                   <ul className="flex flex-col gap-1">
                     {docs.map((d) => (
                       <li key={d.nombre}>

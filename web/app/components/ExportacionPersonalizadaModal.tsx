@@ -6,10 +6,18 @@ import { ExportacionProgresoOverlay } from "@/app/components/ExportacionProgreso
 import { OfficeClientPreview } from "@/app/components/OfficeClientPreview";
 import {
   comprasmxApiBase,
-  mensajeErrorConexionComprasmxApi,
+  errorUiDesdeJson,
+  fetchComprasmxConTimeout,
   proxiedComprasmxUrl,
   readComprasmxJsonResponse,
 } from "@/lib/comprasmx-api";
+import { esErrorStallStream } from "@/lib/comprasmx-stream";
+import {
+  errorValidacionComprasmx,
+  resolverErrorComprasmxUsuario,
+  type ComprasmxUiError,
+} from "@/lib/comprasmx-servicio";
+import { ComprasmxErrorAviso } from "@/app/components/ComprasmxErrorAviso";
 import {
   categoriaVistaDocumento,
   claveDocumentoExport,
@@ -73,9 +81,9 @@ export function ExportacionPersonalizadaModal({
   const [pdfLoading, setPdfLoading] = useState(false);
   const [imgLoading, setImgLoading] = useState(false);
   const [loadingDocs, setLoadingDocs] = useState(false);
-  const [docsError, setDocsError] = useState<string | null>(null);
+  const [docsError, setDocsError] = useState<ComprasmxUiError | null>(null);
   const [exportando, setExportando] = useState(false);
-  const [exportError, setExportError] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<ComprasmxUiError | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -139,7 +147,7 @@ export function ExportacionPersonalizadaModal({
   const continuarADocumentos = useCallback(async () => {
     const ids = [...licSel];
     if (ids.length === 0) {
-      setDocsError("Selecciona al menos una licitación.");
+      setDocsError(errorValidacionComprasmx("Selecciona al menos una licitación."));
       return;
     }
     setDocsError(null);
@@ -160,7 +168,8 @@ export function ExportacionPersonalizadaModal({
         const r = await fetch(`${api}/documentos?${new URLSearchParams({ numeroIdentificacion: id }).toString()}`);
         const parsed = await readComprasmxJsonResponse<DocumentosResponse>(r);
         if (!parsed.ok) {
-          throw new Error(`${id}: ${parsed.error}`);
+          setDocsError(errorUiDesdeJson(parsed, "documentos"));
+          return;
         }
         const lista = mapearDocumentos(parsed.data);
         map[id] = lista;
@@ -174,7 +183,7 @@ export function ExportacionPersonalizadaModal({
       setPreview(null);
       setPaso("documentos");
     } catch (e) {
-      setDocsError(mensajeErrorConexionComprasmxApi(e, "documentos"));
+      setDocsError(resolverErrorComprasmxUsuario({ err: e }, "documentos"));
     } finally {
       setLoadingDocs(false);
     }
@@ -231,7 +240,7 @@ export function ExportacionPersonalizadaModal({
     const filasExport = filas.filter((f) => licSel.has(f.numeroIdentificacion));
     if (filasExport.length === 0) return;
     if (docsSel.size === 0) {
-      setExportError("Selecciona al menos un documento para incluir en el ZIP.");
+      setExportError(errorValidacionComprasmx("Selecciona al menos un documento para incluir en el ZIP."));
       return;
     }
 
@@ -246,16 +255,20 @@ export function ExportacionPersonalizadaModal({
     setExportando(true);
     setExportError(null);
     try {
-      const r = await fetch(`${api}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          filas: filasExport,
-          fetchedAt,
-          filtros,
-          documentosPorExpediente,
-        }),
-      });
+      const r = await fetchComprasmxConTimeout(
+        `${api}/export`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            filas: filasExport,
+            fetchedAt,
+            filtros,
+            documentosPorExpediente,
+          }),
+        },
+        1_800_000,
+      );
       if (!r.ok) {
         let msg = `Exportación falló (${r.status})`;
         try {
@@ -264,7 +277,8 @@ export function ExportacionPersonalizadaModal({
         } catch {
           /* ignore */
         }
-        throw new Error(msg);
+        setExportError(resolverErrorComprasmxUsuario({ status: r.status, error: msg }, "exportacion"));
+        return;
       }
       const blob = await r.blob();
       const disp = r.headers.get("Content-Disposition") ?? "";
@@ -281,7 +295,7 @@ export function ExportacionPersonalizadaModal({
       URL.revokeObjectURL(url);
       onClose();
     } catch (e) {
-      setExportError(mensajeErrorConexionComprasmxApi(e, "generico"));
+      setExportError(resolverErrorComprasmxUsuario({ err: e, sinRespuesta: esErrorStallStream(e) }, "exportacion"));
     } finally {
       setExportando(false);
     }
@@ -495,12 +509,8 @@ export function ExportacionPersonalizadaModal({
         )}
 
         <div className="shrink-0 border-t border-zinc-200 px-4 py-3 dark:border-zinc-800">
-          {docsError ? (
-            <p className="mb-2 text-sm text-red-600 dark:text-red-400">{docsError}</p>
-          ) : null}
-          {exportError ? (
-            <p className="mb-2 text-sm text-red-600 dark:text-red-400">{exportError}</p>
-          ) : null}
+          <ComprasmxErrorAviso error={docsError} className="mb-2" />
+          <ComprasmxErrorAviso error={exportError} className="mb-2" />
           {paso === "documentos" && totalDocsSel === 0 && !exportando ? (
             <p className="mb-2 text-xs text-amber-800 dark:text-amber-200">
               Marca al menos un documento o usa «Todos los docs» para poder exportar.

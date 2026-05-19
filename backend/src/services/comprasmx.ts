@@ -1179,7 +1179,7 @@ async function descargarAnexosPorIconosDescargar(
 
   if (saved > 0) {
     emit?.({
-      phase: "descarga",
+      phase: useDrive ? "drive" : "descarga",
       message: `Anexos guardados (${useDrive ? "Google Drive" : "disco local"}): ${saved} archivo(s).`,
       numeroIdentificacion: expedienteListadoId,
     });
@@ -1574,6 +1574,7 @@ export type ComprasmxSnapshotProgressEvent = {
     | "coincidencias"
     | "detalle"
     | "descarga"
+    | "drive"
     | "fin";
   message: string;
   index?: number;
