@@ -23,12 +23,18 @@ import {
   etiquetaEntidadFederativa,
 } from "@/lib/comprasmx-defaults";
 import { esFechaIsoValida, fechaIsoHoyMexico } from "@/lib/fecha-mexico";
+import { formatoDuracionSegundos } from "@/lib/formato-duracion";
 import { officeClienteTipo } from "@/lib/office-client-preview";
 import { DocumentoPreviewLoading } from "@/app/components/DocumentoPreviewLoading";
+import { PalabrasClaveChips } from "@/app/components/PalabrasClaveChips";
 import {
   ExportacionPersonalizadaModal,
   type DocumentoExportRow,
 } from "@/app/components/ExportacionPersonalizadaModal";
+import {
+  ExportacionProgresoOverlay,
+  type ProgresoOverlayConfig,
+} from "@/app/components/ExportacionProgresoOverlay";
 import { OfficeClientPreview } from "@/app/components/OfficeClientPreview";
 
 type DetalleProcedimientoResumen = {
@@ -113,15 +119,6 @@ type SnapshotProgressLine = {
   at: string;
   detalle?: string;
 };
-
-function formatoDuracionSegundos(totalSec: number): string {
-  const s = Math.max(0, Math.floor(totalSec));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const r = s % 60;
-  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
-  return `${m}:${String(r).padStart(2, "0")}`;
-}
 
 function extDeNombre(nombre: string): string {
   const i = nombre.lastIndexOf(".");
@@ -226,7 +223,7 @@ export function ComprasmxPanel() {
   const [fechaISO, setFechaISO] = useState(fechaIsoHoyMexico);
   const [entidadesLista, setEntidadesLista] = useState<string[]>([...ENTIDADES_TODAS_FALLBACK]);
   const [entSel, setEntSel] = useState<Set<string>>(() => new Set(DEFAULT_ENTIDADES_FEDERATIVAS));
-  const [palabrasTexto, setPalabrasTexto] = useState(DEFAULT_PALABRAS_CLAVE.join("\n"));
+  const [palabrasClave, setPalabrasClave] = useState<string[]>([...DEFAULT_PALABRAS_CLAVE]);
   const [headed, setHeaded] = useState(false);
 
   const [loadingSnap, setLoadingSnap] = useState(false);
@@ -251,7 +248,9 @@ export function ComprasmxPanel() {
   const [pdfLoading, setPdfLoading] = useState(false);
   const [imgLoading, setImgLoading] = useState(false);
   const [downloadingAllDocs, setDownloadingAllDocs] = useState(false);
+  const [downloadingZip, setDownloadingZip] = useState(false);
   const [docZipHref, setDocZipHref] = useState<string | null>(null);
+  const [progresoOverlay, setProgresoOverlay] = useState<ProgresoOverlayConfig | null>(null);
 
   const [snapshotProgressOpen, setSnapshotProgressOpen] = useState(false);
   const [snapshotProgressLog, setSnapshotProgressLog] = useState<SnapshotProgressLine[]>([]);
@@ -307,9 +306,50 @@ export function ComprasmxPanel() {
     setImgLoading(true);
   }, [preview?.nombre, preview?.url, preview?.modoPdf, preview?.modoOfficeCliente]);
 
+  const descargarZipExpediente = useCallback(async () => {
+    if (!docZipHref || !docModal || docs.length === 0 || loadingDocs) return;
+    const expediente = docModal;
+    setDownloadingZip(true);
+    setProgresoOverlay({ tipo: "descarga-zip", expediente, archivosCount: docs.length });
+    setDocsError(null);
+    try {
+      const r = await fetch(docZipHref);
+      if (!r.ok) {
+        let msg = `No se pudo descargar el ZIP (${r.status})`;
+        try {
+          const j = (await r.json()) as { error?: string };
+          if (typeof j.error === "string") msg = j.error;
+        } catch {
+          /* ignore */
+        }
+        throw new Error(msg);
+      }
+      const blob = await r.blob();
+      const disp = r.headers.get("Content-Disposition") ?? "";
+      const m = /filename="?([^";\n]+)"?/i.exec(disp);
+      const filename = m?.[1]?.trim() || `${expediente.replace(/[^\w.-]+/g, "_")}-anexos.zip`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.rel = "noopener";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setDocsError(mensajeErrorConexionComprasmxApi(e, "generico"));
+    } finally {
+      setDownloadingZip(false);
+      setProgresoOverlay(null);
+    }
+  }, [docModal, docZipHref, docs.length, loadingDocs]);
+
   const descargarTodosDocumentos = useCallback(async () => {
-    if (docs.length === 0) return;
+    if (docs.length === 0 || !docModal) return;
+    const expediente = docModal;
     setDownloadingAllDocs(true);
+    setProgresoOverlay({ tipo: "descarga-individuales", expediente, archivosCount: docs.length });
     try {
       for (const d of docs) {
         try {
@@ -332,8 +372,9 @@ export function ComprasmxPanel() {
       }
     } finally {
       setDownloadingAllDocs(false);
+      setProgresoOverlay(null);
     }
-  }, [docs]);
+  }, [docModal, docs]);
 
   useEffect(() => {
     if (!snapshotProgressOpen || snapshotProgressLog.length === 0) return;
@@ -360,14 +401,7 @@ export function ComprasmxPanel() {
     });
   }, []);
 
-  const palabrasClavePayload = useCallback(
-    () =>
-      palabrasTexto
-        .split(/\r?\n/)
-        .map((s) => s.trim())
-        .filter(Boolean),
-    [palabrasTexto],
-  );
+  const palabrasClavePayload = useCallback(() => palabrasClave, [palabrasClave]);
 
   const requisitosBusqueda = useMemo(() => {
     const faltantes: string[] = [];
@@ -1088,23 +1122,7 @@ export function ComprasmxPanel() {
           </div>
         </div>
 
-        <div className="flex flex-col gap-2">
-          <label htmlFor="kw" className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
-            Palabras clave (una por línea → arreglo `palabrasClave`)
-          </label>
-          <textarea
-            id="kw"
-            rows={8}
-            value={palabrasTexto}
-            onChange={(e) => setPalabrasTexto(e.target.value)}
-            aria-invalid={palabrasClavePayload().length === 0}
-            className={`w-full rounded-lg border bg-white p-3 font-mono text-sm dark:bg-zinc-900 ${
-              palabrasClavePayload().length > 0
-                ? "border-zinc-300 dark:border-zinc-700"
-                : "border-amber-500 dark:border-amber-600"
-            }`}
-          />
-        </div>
+        <PalabrasClaveChips palabras={palabrasClave} onChange={setPalabrasClave} />
 
         <label className="flex items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
           <input type="checkbox" checked={headed} onChange={(e) => setHeaded(e.target.checked)} className="size-4" />
@@ -1147,7 +1165,7 @@ export function ComprasmxPanel() {
             <span className="font-medium">
               {fechaISO.trim()} · {entSel.size} entidad(es) · {palabrasClavePayload().length} palabra(s) clave
             </span>
-            . Debe coincidir con Postman (misma fecha, mismas entidades y mismas líneas en el cuadro de palabras).
+            . Debe coincidir con Postman (misma fecha, mismas entidades y el mismo arreglo de palabras clave).
           </p>
         ) : null}
 
@@ -1235,19 +1253,19 @@ export function ComprasmxPanel() {
                 Documentos — {docModal}
               </h2>
               <div className="flex shrink-0 flex-wrap items-center gap-2">
-                <a
-                  href={docZipHref && docs.length > 0 && !loadingDocs ? docZipHref : undefined}
-                  download
-                  aria-disabled={!docZipHref || docs.length === 0 || loadingDocs}
-                  className={`inline-flex items-center justify-center rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white no-underline hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white ${
-                    !docZipHref || docs.length === 0 || loadingDocs ? "pointer-events-none opacity-50" : ""
-                  }`}
-                >
-                  Descargar ZIP
-                </a>
                 <button
                   type="button"
-                  disabled={loadingDocs || docs.length === 0 || downloadingAllDocs}
+                  disabled={
+                    !docZipHref || docs.length === 0 || loadingDocs || downloadingZip || downloadingAllDocs
+                  }
+                  onClick={() => void descargarZipExpediente()}
+                  className="inline-flex items-center justify-center rounded-lg bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-800 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white"
+                >
+                  {downloadingZip ? "Descargando ZIP…" : "Descargar ZIP"}
+                </button>
+                <button
+                  type="button"
+                  disabled={loadingDocs || docs.length === 0 || downloadingAllDocs || downloadingZip}
                   onClick={() => void descargarTodosDocumentos()}
                   className="rounded-lg border border-emerald-600 bg-emerald-50 px-3 py-1.5 text-sm font-medium text-emerald-900 hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-500 dark:bg-emerald-950/50 dark:text-emerald-100 dark:hover:bg-emerald-900/60"
                 >
@@ -1259,6 +1277,8 @@ export function ComprasmxPanel() {
                   onClick={() => {
                     setDocModal(null);
                     setDownloadingAllDocs(false);
+                    setDownloadingZip(false);
+                    setProgresoOverlay(null);
                     setDocZipHref(null);
                     setPreview(null);
                     setPdfLoading(false);
@@ -1400,6 +1420,18 @@ export function ComprasmxPanel() {
           fetchedAt={snapshot.fetchedAt}
           filtros={snapshot.filtros}
           documentosHistorial={exportHistorialDocs}
+        />
+      ) : null}
+
+      {progresoOverlay ? (
+        <ExportacionProgresoOverlay open config={progresoOverlay} />
+      ) : exportingAll ? (
+        <ExportacionProgresoOverlay
+          open
+          config={{
+            tipo: "export-completa",
+            licitacionesCount: snapshot?.filas?.length ?? 0,
+          }}
         />
       ) : null}
     </div>

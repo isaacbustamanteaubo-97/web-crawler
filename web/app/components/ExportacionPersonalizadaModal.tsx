@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { DocumentoPreviewLoading } from "@/app/components/DocumentoPreviewLoading";
+import { ExportacionProgresoOverlay } from "@/app/components/ExportacionProgresoOverlay";
 import { OfficeClientPreview } from "@/app/components/OfficeClientPreview";
 import {
   comprasmxApiBase,
@@ -291,6 +292,7 @@ export function ExportacionPersonalizadaModal({
   const totalDocsSel = docsSel.size;
 
   return (
+    <>
     <div
       className="fixed inset-0 z-[62] flex items-center justify-center bg-black/55 p-2 sm:p-4"
       role="dialog"
@@ -499,6 +501,11 @@ export function ExportacionPersonalizadaModal({
           {exportError ? (
             <p className="mb-2 text-sm text-red-600 dark:text-red-400">{exportError}</p>
           ) : null}
+          {paso === "documentos" && totalDocsSel === 0 && !exportando ? (
+            <p className="mb-2 text-xs text-amber-800 dark:text-amber-200">
+              Marca al menos un documento o usa «Todos los docs» para poder exportar.
+            </p>
+          ) : null}
           <div className="flex flex-wrap items-center justify-between gap-2">
             {paso === "documentos" ? (
               <button
@@ -534,15 +541,27 @@ export function ExportacionPersonalizadaModal({
                         }
                       }
                       setDocsSel(todos);
+                      setExportError(null);
                     }}
                   >
                     Todos los docs
                   </button>
                   <button
                     type="button"
+                    className="rounded-md border border-zinc-300 px-2 py-1 text-xs dark:border-zinc-600"
+                    onClick={() => {
+                      setDocsSel(new Set());
+                      setExportError(null);
+                    }}
+                  >
+                    Ningún documento
+                  </button>
+                  <button
+                    type="button"
                     disabled={exportando || totalDocsSel === 0}
+                    title={totalDocsSel === 0 ? "Selecciona al menos un documento para exportar." : undefined}
                     onClick={() => void exportarSeleccion()}
-                    className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-800 disabled:opacity-50"
+                    className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-800 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {exportando ? "Generando ZIP…" : `Exportar ZIP + resumen (${licSel.size} lic., ${totalDocsSel} docs)`}
                   </button>
@@ -553,5 +572,14 @@ export function ExportacionPersonalizadaModal({
         </div>
       </div>
     </div>
+    <ExportacionProgresoOverlay
+      open={exportando}
+      config={{
+        tipo: "export-personalizada",
+        licitacionesCount: licSel.size,
+        documentosCount: totalDocsSel,
+      }}
+    />
+    </>
   );
 }
