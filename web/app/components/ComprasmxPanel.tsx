@@ -23,6 +23,9 @@ import {
   etiquetaEntidadFederativa,
 } from "@/lib/comprasmx-defaults";
 import { esFechaIsoValida, fechaIsoHoyMexico } from "@/lib/fecha-mexico";
+import { officeClienteTipo } from "@/lib/office-client-preview";
+import { DocumentoPreviewLoading } from "@/app/components/DocumentoPreviewLoading";
+import { OfficeClientPreview } from "@/app/components/OfficeClientPreview";
 
 type DetalleProcedimientoResumen = {
   numeroProcedimientoContratacion?: string | null;
@@ -51,6 +54,7 @@ type ComprasmxFila = {
 type SnapshotResponse = {
   filas: ComprasmxFila[];
   totalFilas: number;
+  totalEnPieDePortal?: number;
   filtros?: Record<string, unknown>;
   /** Viene del API al completar el snapshot. */
   fetchedAt?: string;
@@ -75,6 +79,11 @@ type DocumentoRow = {
   urlDescarga: string;
   /** PDF para iframe: nativos o Office convertido en el API (`vista=pdf`). */
   urlVistaPdf?: string;
+  /** Google Docs Viewer (Word, Excel, PowerPoint, etc.). */
+  urlVistaGoogle?: string;
+  vistaGoogleModo?: "drive-preview" | "gview";
+  urlVistaGoogleDrive?: string;
+  avisoVistaGoogle?: string;
 };
 
 type DocumentosResponse = {
@@ -166,6 +175,42 @@ function DetalleProcedimientoBloque({ detalle }: { detalle: DetalleProcedimiento
   );
 }
 
+function esZipAnexoListado(nombre: string): boolean {
+  return nombre.toLowerCase().endsWith(".zip");
+}
+
+function resumenFiltrosSnapshot(snap: SnapshotResponse): string | null {
+  const filtros = snap.filtros;
+  if (!filtros) return null;
+  const partes: string[] = [];
+  const desde = filtros.fechaPublicacionDesde;
+  const hasta = filtros.fechaPublicacionHasta;
+  if (typeof desde === "string" && typeof hasta === "string") {
+    partes.push(`fecha ${desde}${desde !== hasta ? `–${hasta}` : ""}`);
+  }
+  const entidades = filtros.entidadesFederativas;
+  if (Array.isArray(entidades)) {
+    partes.push(`${entidades.length} entidad(es)`);
+  }
+  const kws = filtros.palabrasClave;
+  if (Array.isArray(kws)) {
+    partes.push(`${kws.length} palabra(s) clave`);
+  }
+  const coincidencias = filtros.coincidenciasListadoKeyword;
+  if (typeof coincidencias === "number") {
+    partes.push(`${coincidencias} coincidencia(s) en el listado del portal`);
+  }
+  const pie = snap.totalEnPieDePortal;
+  if (typeof pie === "number" && pie > 0) {
+    partes.push(`${pie} filas totales en Compras MX (sin filtro de palabras)`);
+  }
+  const omitidos = filtros.detallesOmitidosPorLimite;
+  if (typeof omitidos === "number" && omitidos > 0) {
+    partes.push(`${omitidos} omitida(s) por límite de detalle`);
+  }
+  return partes.length > 0 ? partes.join(" · ") : null;
+}
+
 function categoriaVista(nombre: string): "pdf" | "imagen" | "texto" | "otro" {
   const e = extDeNombre(nombre);
   if (e === "pdf") return "pdf";
@@ -177,34 +222,6 @@ function categoriaVista(nombre: string): "pdf" | "imagen" | "texto" | "otro" {
 function nombreLocalDescargaSeguro(nombre: string): string {
   const t = nombre.trim() || "documento";
   return t.replace(/[/\\?*:"<>|]/g, "_").slice(0, 240);
-}
-
-function IndicadorCargaVistaPdf({ conversionEnServidor }: { conversionEnServidor?: boolean }) {
-  return (
-    <div
-      className="flex min-h-[220px] flex-1 flex-col justify-center gap-3 bg-zinc-50/80 px-6 py-10 dark:bg-zinc-900/60"
-      role="status"
-      aria-busy="true"
-      aria-label={conversionEnServidor ? "Convirtiendo documento a PDF en el servidor" : "Cargando vista PDF"}
-    >
-      <div className="mx-auto h-1.5 w-full max-w-md overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-700">
-        <div className="comprasmx-indeterminate-bar h-full rounded-full bg-gradient-to-r from-emerald-700 via-emerald-400 to-emerald-600 dark:from-emerald-500 dark:via-emerald-300 dark:to-emerald-500" />
-      </div>
-      <p className="flex flex-wrap items-center justify-center gap-2 text-center text-sm font-medium text-emerald-800 dark:text-emerald-300">
-        <span className="inline-flex items-center gap-0.5" aria-hidden>
-          <span className="inline-block size-1.5 animate-bounce rounded-full bg-emerald-600 [animation-delay:-0.25s] dark:bg-emerald-400" />
-          <span className="inline-block size-1.5 animate-bounce rounded-full bg-emerald-600 [animation-delay:-0.12s] dark:bg-emerald-400" />
-          <span className="inline-block size-1.5 animate-bounce rounded-full bg-emerald-600 dark:bg-emerald-400" />
-        </span>
-        {conversionEnServidor ? "Convirtiendo a PDF en el servidor…" : "Cargando vista PDF…"}
-      </p>
-      <p className="mx-auto max-w-md text-center text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
-        {conversionEnServidor
-          ? "En documentos grandes puede tardar más de un minuto. No cierres el modal hasta que termine."
-          : "Obteniendo el archivo para mostrarlo aquí."}
-      </p>
-    </div>
-  );
 }
 
 export function ComprasmxPanel() {
@@ -232,10 +249,11 @@ export function ComprasmxPanel() {
     modoPdf?: boolean;
     /** Office u hoja vía `vista=pdf`: el servidor puede estar convirtiendo. */
     conversionEnServidor?: boolean;
+    modoOfficeCliente?: boolean;
+    officeClienteTipo?: import("@/lib/office-client-preview").OfficeClienteTipo;
   } | null>(null);
-  const [pdfBlobUrl, setPdfBlobUrl] = useState<string | null>(null);
   const [pdfLoading, setPdfLoading] = useState(false);
-  const [pdfFetchError, setPdfFetchError] = useState<string | null>(null);
+  const [imgLoading, setImgLoading] = useState(false);
   const [downloadingAllDocs, setDownloadingAllDocs] = useState(false);
   const [docZipHref, setDocZipHref] = useState<string | null>(null);
 
@@ -278,65 +296,19 @@ export function ComprasmxPanel() {
 
   useEffect(() => {
     if (!preview?.modoPdf || !preview.url) {
-      setPdfBlobUrl((prev) => {
-        if (prev) URL.revokeObjectURL(prev);
-        return null;
-      });
       setPdfLoading(false);
-      setPdfFetchError(null);
       return;
     }
-
-    const ac = new AbortController();
-    let objectUrl: string | null = null;
-
     setPdfLoading(true);
-    setPdfFetchError(null);
-    setPdfBlobUrl((prev) => {
-      if (prev) URL.revokeObjectURL(prev);
-      return null;
-    });
-
-    void (async () => {
-      try {
-        const r = await fetch(preview.url, { signal: ac.signal });
-        if (!r.ok) {
-          if (r.status === 502 || r.status === 503 || r.status === 504) {
-            throw new Error("proxy");
-          }
-          const ct = r.headers.get("content-type") ?? "";
-          const t = await r.text().catch(() => "");
-          if (ct.includes("application/json") && t.trim()) {
-            try {
-              const j = JSON.parse(t) as { error?: string };
-              if (typeof j.error === "string" && j.error.trim()) throw new Error(j.error);
-            } catch (e) {
-              if (e instanceof Error && e.message !== t) throw e;
-            }
-          }
-          throw new Error(t.slice(0, 500) || `HTTP ${r.status}`);
-        }
-        const blob = await r.blob();
-        objectUrl = URL.createObjectURL(blob);
-        if (ac.signal.aborted) {
-          URL.revokeObjectURL(objectUrl);
-          return;
-        }
-        setPdfBlobUrl(objectUrl);
-        objectUrl = null;
-      } catch (e) {
-        if (ac.signal.aborted) return;
-        setPdfFetchError(mensajeErrorConexionComprasmxApi(e, "pdf"));
-      } finally {
-        if (!ac.signal.aborted) setPdfLoading(false);
-      }
-    })();
-
-    return () => {
-      ac.abort();
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
   }, [preview?.modoPdf, preview?.url]);
+
+  useEffect(() => {
+    if (!preview || preview.modoPdf || preview.modoOfficeCliente || categoriaVista(preview.nombre) !== "imagen") {
+      setImgLoading(false);
+      return;
+    }
+    setImgLoading(true);
+  }, [preview?.nombre, preview?.url, preview?.modoPdf, preview?.modoOfficeCliente]);
 
   const descargarTodosDocumentos = useCallback(async () => {
     if (docs.length === 0) return;
@@ -733,7 +705,7 @@ export function ComprasmxPanel() {
             `/comprasmx/documentos/zip?${new URLSearchParams({ numeroIdentificacion: idTrim }).toString()}`,
           );
           setDocZipHref(zipHref);
-          setDocs(cached as DocumentoRow[]);
+          setDocs((cached as DocumentoRow[]).filter((d) => !esZipAnexoListado(d.nombre)));
           setLoadingDocs(false);
           return;
         }
@@ -755,11 +727,14 @@ export function ComprasmxPanel() {
                 `/comprasmx/documentos/zip?${new URLSearchParams({ numeroIdentificacion: idTrim }).toString()}`,
               );
         setDocZipHref(zipHref);
-        const mapped = j.documentos.map((d) => ({
-          ...d,
-          urlDescarga: proxiedComprasmxUrl(d.urlDescarga),
-          ...(d.urlVistaPdf ? { urlVistaPdf: proxiedComprasmxUrl(d.urlVistaPdf) } : {}),
-        }));
+        const mapped = j.documentos
+          .filter((d) => !esZipAnexoListado(d.nombre))
+          .map((d) => ({
+            ...d,
+            urlDescarga: proxiedComprasmxUrl(d.urlDescarga),
+            ...(d.urlVistaPdf ? { urlVistaPdf: proxiedComprasmxUrl(d.urlVistaPdf) } : {}),
+            /* urlVistaGoogle es https://docs.google.com/... — no pasa por el proxy */
+          }));
         setDocs(mapped);
         mergeDocumentosIntoHistoryEntry(activeHistoryEntryIdRef.current, idTrim, mapped);
       } catch (e) {
@@ -790,11 +765,31 @@ export function ComprasmxPanel() {
         return;
       }
       if (cat === "pdf") {
-        setPreview({ nombre: d.nombre, url: d.urlDescarga, modoPdf: true, conversionEnServidor: false });
+        setPreview({
+          nombre: d.nombre,
+          url: d.urlDescarga,
+          modoPdf: true,
+          conversionEnServidor: false,
+        });
+        return;
+      }
+      const officeTipo = officeClienteTipo(d.nombre);
+      if (officeTipo) {
+        setPreview({
+          nombre: d.nombre,
+          url: d.urlDescarga,
+          modoOfficeCliente: true,
+          officeClienteTipo: officeTipo,
+        });
         return;
       }
       if (d.urlVistaPdf) {
-        setPreview({ nombre: d.nombre, url: d.urlVistaPdf, modoPdf: true, conversionEnServidor: true });
+        setPreview({
+          nombre: d.nombre,
+          url: d.urlVistaPdf,
+          modoPdf: true,
+          conversionEnServidor: true,
+        });
         return;
       }
       if (cat === "imagen") {
@@ -1227,6 +1222,16 @@ export function ComprasmxPanel() {
           </p>
         ) : null}
 
+        {requisitosBusqueda.ok && !loadingSnap ? (
+          <p className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-xs text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900/60 dark:text-zinc-300">
+            Se enviará al API:{" "}
+            <span className="font-medium">
+              {fechaISO.trim()} · {entSel.size} entidad(es) · {palabrasClavePayload().length} palabra(s) clave
+            </span>
+            . Debe coincidir con Postman (misma fecha, mismas entidades y mismas líneas en el cuadro de palabras).
+          </p>
+        ) : null}
+
         {snapError ? (
           <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
             {snapError}
@@ -1252,6 +1257,12 @@ export function ComprasmxPanel() {
           {exportError ? (
             <p className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
               {exportError}
+            </p>
+          ) : null}
+          {resumenFiltrosSnapshot(snapshot) ? (
+            <p className="mt-3 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-xs text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900/50 dark:text-zinc-300">
+              <span className="font-medium text-zinc-900 dark:text-zinc-100">Filtros aplicados en esta consulta:</span>{" "}
+              {resumenFiltrosSnapshot(snapshot)}
             </p>
           ) : null}
           <ul className="mt-6 flex flex-col gap-6">
@@ -1321,12 +1332,8 @@ export function ComprasmxPanel() {
                     setDownloadingAllDocs(false);
                     setDocZipHref(null);
                     setPreview(null);
-                    setPdfBlobUrl((prev) => {
-                      if (prev) URL.revokeObjectURL(prev);
-                      return null;
-                    });
-                    setPdfFetchError(null);
                     setPdfLoading(false);
+                    setImgLoading(false);
                   }}
                 >
                   Cerrar
@@ -1365,51 +1372,80 @@ export function ComprasmxPanel() {
                   </ul>
                 </div>
               </div>
-              <div className="relative flex min-h-0 flex-1 flex-col bg-zinc-50 dark:bg-zinc-900">
+              <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden bg-zinc-50 dark:bg-zinc-900">
                 {!preview ? (
-                  <p className="p-4 text-sm text-zinc-500">Selecciona un archivo para previsualizarlo.</p>
+                  <div className="flex min-h-[min(50vh,420px)] flex-1 flex-col items-center justify-center px-6 py-12 text-center">
+                    <div
+                      className="flex size-16 items-center justify-center rounded-2xl border border-emerald-200/80 bg-emerald-50 shadow-sm dark:border-emerald-800/60 dark:bg-emerald-950/40"
+                      aria-hidden
+                    >
+                      <svg
+                        className="size-8 text-emerald-700 dark:text-emerald-400"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                        strokeWidth={1.5}
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"
+                        />
+                      </svg>
+                    </div>
+                    <p className="mt-5 text-base font-semibold text-zinc-800 dark:text-zinc-100">
+                      Selecciona un archivo para previsualizarlo
+                    </p>
+                    <p className="mt-2 max-w-sm text-sm leading-relaxed text-zinc-500 dark:text-zinc-400">
+                      Elige un documento de la lista de la izquierda. Podrás ver PDF, Word, Excel o imágenes aquí mismo.
+                    </p>
+                  </div>
+                ) : preview.modoOfficeCliente && preview.officeClienteTipo ? (
+                  <OfficeClientPreview
+                    key={`${preview.url}:${preview.nombre}`}
+                    nombre={preview.nombre}
+                    url={preview.url}
+                    tipo={preview.officeClienteTipo}
+                  />
                 ) : preview.modoPdf ? (
-                  <div className="flex min-h-0 flex-1 flex-col">
-                    {pdfLoading && !pdfBlobUrl ? (
-                      <IndicadorCargaVistaPdf conversionEnServidor={preview.conversionEnServidor} />
+                  <div className="relative flex min-h-0 flex-1 flex-col">
+                    {pdfLoading ? (
+                      <DocumentoPreviewLoading conversionEnServidor={preview.conversionEnServidor} />
                     ) : null}
-                    {pdfFetchError ? (
-                      <div className="flex flex-1 flex-col gap-3 p-4 text-sm text-red-700 dark:text-red-300">
-                        <p>No se pudo cargar la vista PDF: {pdfFetchError}</p>
-                        <a
-                          href={preview.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex w-fit rounded-lg bg-zinc-900 px-3 py-2 text-white dark:bg-zinc-100 dark:text-zinc-900"
-                        >
-                          Abrir URL en pestaña nueva
-                        </a>
-                      </div>
-                    ) : null}
-                    {pdfBlobUrl ? (
-                      <iframe
-                        title={preview.nombre}
-                        src={pdfBlobUrl}
-                        className="min-h-[min(85dvh,880px)] w-full flex-1 border-0 md:min-h-0"
-                      />
-                    ) : null}
+                    <iframe
+                      title={preview.nombre}
+                      src={preview.url}
+                      className={`min-h-[min(85dvh,880px)] w-full flex-1 border-0 md:min-h-0 ${pdfLoading ? "invisible absolute inset-0 h-0 w-0 overflow-hidden" : ""}`}
+                      onLoad={() => setPdfLoading(false)}
+                    />
                   </div>
                 ) : categoriaVista(preview.nombre) === "imagen" ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img
-                    src={preview.url}
-                    alt={preview.nombre}
-                    className="max-h-[min(85vh,900px)] w-full flex-1 object-contain p-2"
-                  />
+                  <div className="relative flex min-h-0 flex-1 flex-col">
+                    {imgLoading ? <DocumentoPreviewLoading titulo="Cargando imagen desde el servidor…" /> : null}
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={preview.url}
+                      alt={preview.nombre}
+                      className={`max-h-[min(85vh,900px)] w-full flex-1 object-contain p-2 ${imgLoading ? "invisible" : ""}`}
+                      onLoad={() => setImgLoading(false)}
+                      onError={() => setImgLoading(false)}
+                    />
+                  </div>
                 ) : categoriaVista(preview.nombre) === "texto" ? (
-                  <pre className="min-h-0 flex-1 overflow-auto p-4 font-mono text-xs leading-relaxed text-zinc-800 dark:text-zinc-200">
-                    {preview.texto ?? "Cargando…"}
-                  </pre>
+                  preview.texto ? (
+                    <pre className="min-h-0 flex-1 overflow-auto p-4 font-mono text-xs leading-relaxed text-zinc-800 dark:text-zinc-200">
+                      {preview.texto}
+                    </pre>
+                  ) : (
+                    <div className="relative min-h-[220px] flex-1">
+                      <DocumentoPreviewLoading titulo="Cargando texto desde el servidor…" />
+                    </div>
+                  )
                 ) : (
                   <div className="flex flex-col gap-3 p-4 text-sm text-zinc-700 dark:text-zinc-300">
                     <p>
-                      Vista previa no disponible para <strong>{extDeNombre(preview.nombre) || "este formato"}</strong>.
-                      Descarga el archivo y ábrelo en Word, PowerPoint o Excel.
+                      Vista previa no disponible para <strong>{extDeNombre(preview.nombre) || "este formato"}</strong>{" "}
+                      (p. ej. PowerPoint). Descarga el archivo y ábrelo en Office.
                     </p>
                     <a
                       href={preview.url}

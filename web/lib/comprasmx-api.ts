@@ -62,25 +62,46 @@ export async function readComprasmxJsonResponse<T>(r: Response): Promise<Compras
 }
 
 export function proxiedComprasmxUrl(pathOrUrl: string): string {
-  const base = comprasmxApiBase();
-  if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) {
+  const base = comprasmxApiBase().replace(/\/$/, "");
+  const raw = pathOrUrl.trim();
+  if (!raw) return base;
+
+  /** Ya es ruta del proxy Next o URL del API del front — no duplicar prefijo. */
+  if (raw.startsWith("/api/comprasmx/") || raw === "/api/comprasmx") {
+    return raw;
+  }
+  if (base.startsWith("/") && (raw.startsWith(`${base}/`) || raw === base)) {
+    return raw;
+  }
+
+  if (raw.startsWith("http://") || raw.startsWith("https://")) {
     try {
-      const u = new URL(pathOrUrl);
+      const u = new URL(raw);
       if (u.pathname.startsWith("/comprasmx/")) {
-        return `${base}${u.pathname}${u.search}`;
+        const rest = u.pathname.slice("/comprasmx".length) || "";
+        return `${base}${rest}${u.search}`;
+      }
+      if (u.pathname.startsWith("/api/comprasmx/")) {
+        return `${u.pathname}${u.search}`;
       }
     } catch {
       /* ignore */
     }
-    return pathOrUrl;
+    return raw;
   }
-  if (pathOrUrl.startsWith("/comprasmx/")) {
-    return `${base}${pathOrUrl.slice("/comprasmx".length)}`;
+
+  if (raw.startsWith("/comprasmx/")) {
+    return `${base}${raw.slice("/comprasmx".length)}`;
   }
-  if (pathOrUrl.startsWith("/")) {
-    return `${base}${pathOrUrl}`;
+
+  if (raw.startsWith("/")) {
+    if (base.startsWith("http://") || base.startsWith("https://")) {
+      return `${base}${raw}`;
+    }
+    return `${base}${raw}`;
   }
-  return `${base}/${pathOrUrl}`;
+
+  return `${base}/${raw}`;
 }
 
 /**

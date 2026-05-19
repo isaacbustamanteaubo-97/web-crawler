@@ -12,6 +12,9 @@ export type HistorialDocumentoFila = {
   modificadoIso: string;
   urlDescarga: string;
   urlVistaPdf?: string;
+  urlVistaGoogle?: string;
+  urlVistaGoogleDrive?: string;
+  avisoVistaGoogle?: string;
 };
 
 export type ComprasmxHistoryEntry = {

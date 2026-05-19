@@ -29,10 +29,17 @@ import {
   parseFilasExportBody,
   streamExportLicitacionesZip,
 } from "../services/exportLicitaciones.js";
+import { verifyArchivoViewerToken } from "../services/archivoViewerToken.js";
+import {
+  buildPublicArchivoUrl,
+  publicApiOrigin,
+  resolverUrlsGoogleDocsViewer,
+} from "../services/googleDocsViewer.js";
 import {
   esNombreArchivoConvertibleVistaPdf,
   resolverPdfVistaPrevia,
 } from "../services/officePdfPreview.js";
+import { listarDocumentosComprasmx } from "../services/anexoStorage.js";
 
 function extArchivoLower(nombre: string): string {
   const base = path.basename(nombre.trim());
@@ -281,9 +288,9 @@ comprasmxRouter.get("/documentos", async (req: Request, res: Response, next: Nex
       });
       return;
     }
-    let data;
+    let listed;
     try {
-      data = await listarDocumentosLocalesComprasmx(id);
+      listed = await listarDocumentosComprasmx(id);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       res.status(503).json({
@@ -291,6 +298,14 @@ comprasmxRouter.get("/documentos", async (req: Request, res: Response, next: Nex
       });
       return;
     }
+    const data = {
+      numeroIdentificacion: listed.numeroIdentificacion,
+      carpetaEnDisco: listed.ubicacion,
+      almacenamiento: listed.almacenamiento,
+      total: listed.total,
+      documentos: listed.documentos,
+    };
+    const apiOrigin = publicApiOrigin();
     const qs = (nombre: string) =>
       `${req.baseUrl}/documentos/archivo?${new URLSearchParams({ numeroIdentificacion: data.numeroIdentificacion, nombre }).toString()}`;
     const qsVistaPdf = (nombre: string) =>
@@ -307,10 +322,32 @@ comprasmxRouter.get("/documentos", async (req: Request, res: Response, next: Nex
         const officePreview =
           process.env.COMPRASMX_OFFICE_PDF_PREVIEW === "1" && esNombreArchivoConvertibleVistaPdf(d.nombre);
         const urlVistaPdf = officePreview ? qsVistaPdf(d.nombre) : undefined;
+        const publicArchivoUrl =
+          apiOrigin &&
+          buildPublicArchivoUrl({
+            apiOrigin,
+            basePath: req.baseUrl,
+            numeroIdentificacion: data.numeroIdentificacion,
+            nombre: d.nombre,
+          });
+        const google = resolverUrlsGoogleDocsViewer({
+          nombreArchivo: d.nombre,
+          numeroIdentificacion: data.numeroIdentificacion,
+          driveFileId: d.driveFileId,
+          publicArchivoUrl,
+        });
         return {
           ...d,
           urlDescarga: qs(d.nombre),
           ...(urlVistaPdf ? { urlVistaPdf } : {}),
+          ...(google
+            ? {
+                urlVistaGoogle: google.embedUrl,
+                vistaGoogleModo: google.embedModo,
+                urlVistaGoogleDrive: google.alternativaDrivePreview,
+                avisoVistaGoogle: google.aviso,
+              }
+            : {}),
         };
       }),
     });
@@ -403,6 +440,12 @@ comprasmxRouter.get("/documentos/archivo", async (req: Request, res: Response, n
       });
       return;
     }
+    const viewerToken = firstQueryString(req.query.viewerToken);
+    if (viewerToken && !verifyArchivoViewerToken(viewerToken, id, nombre)) {
+      res.status(403).json({ error: "Token de vista inválido o expirado." });
+      return;
+    }
+
     const meta = await resolverDocumentoComprasmx(id, nombre);
     if (!meta) {
       res.status(404).json({ error: "Archivo no encontrado o ruta no permitida." });

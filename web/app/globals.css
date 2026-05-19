@@ -39,3 +39,43 @@ body {
   animation: comprasmx-indeterminate-bar 1.35s ease-in-out infinite;
   will-change: transform;
 }
+
+/* docx-preview pone overflow:hidden en cada página y recorta el contenido largo */
+.cmx-docx-scroll .docx-preview-wrapper {
+  padding-bottom: 30px;
+}
+
+.cmx-docx-scroll section.docx-preview {
+  overflow: visible !important;
+}
+
+.docx-wrapper {
+  padding: 1rem 1.25rem;
+  color: rgb(24 24 27);
+}
+
+@media (prefers-color-scheme: dark) {
+  .docx-wrapper {
+    color: rgb(244 244 245);
+  }
+}
+
+.cmx-xlsx-wrap table {
+  border-collapse: collapse;
+  width: max-content;
+  min-width: 100%;
+}
+
+.cmx-xlsx-wrap td,
+.cmx-xlsx-wrap th {
+  border: 1px solid rgb(212 212 216);
+  padding: 0.35rem 0.5rem;
+  white-space: nowrap;
+}
+
+@media (prefers-color-scheme: dark) {
+  .cmx-xlsx-wrap td,
+  .cmx-xlsx-wrap th {
+    border-color: rgb(63 63 70);
+  }
+}

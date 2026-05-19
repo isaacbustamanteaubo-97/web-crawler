@@ -13,11 +13,20 @@ import {
   listManifestEntries,
   uploadAnexoToDrive,
 } from "./driveStorage.js";
+import { esArchivoZip, extraerZipAnexosHabilitado, extraerZipEnDirectorio } from "./zipAnexo.js";
+
+export { esArchivoZip } from "./zipAnexo.js";
+
+export function filtrarDocumentosVisibles(documentos: ComprasmxDocumentoInfo[]): ComprasmxDocumentoInfo[] {
+  return documentos.filter((d) => !esArchivoZip(d.nombre));
+}
 
 export type ComprasmxDocumentoInfo = {
   nombre: string;
   sizeBytes: number;
   modificadoIso: string;
+  /** Presente cuando el anexo está en Google Drive. */
+  driveFileId?: string;
 };
 
 export function mimePorNombreArchivo(nombre: string): string {
@@ -91,7 +100,8 @@ async function listarDocumentosLocales(numeroIdentificacion: string): Promise<{
     documentos.push({ nombre: ent.name, sizeBytes: st.size, modificadoIso: st.mtime.toISOString() });
   }
   documentos.sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
-  return { numeroIdentificacion: id, carpetaEnDisco: carpeta, total: documentos.length, documentos };
+  const visibles = filtrarDocumentosVisibles(documentos);
+  return { numeroIdentificacion: id, carpetaEnDisco: carpeta, total: visibles.length, documentos: visibles };
 }
 
 async function resolverDocumentoLocal(
@@ -153,11 +163,14 @@ export async function listarDocumentosComprasmx(numeroIdentificacion: string): P
   if (almacenAnexosActivo() === "drive") {
     const folderName = expedienteParaNombreCarpeta(id);
     const { folderId, entries } = await listManifestEntries(folderName);
-    const documentos = entries.map((e) => ({
-      nombre: e.nombre,
-      sizeBytes: e.sizeBytes,
-      modificadoIso: e.uploadedAt,
-    }));
+    const documentos = filtrarDocumentosVisibles(
+      entries.map((e) => ({
+        nombre: e.nombre,
+        sizeBytes: e.sizeBytes,
+        modificadoIso: e.uploadedAt,
+        driveFileId: e.driveFileId,
+      })),
+    );
     return {
       numeroIdentificacion: id,
       almacenamiento: "drive",
@@ -209,6 +222,30 @@ export async function resolverDocumentoComprasmx(
     absolutePath: local.absolutePath,
     compressed: false,
   };
+}
+
+/**
+ * Si el archivo descargado es `.zip`, lo expande en `destDir` y elimina el zip.
+ * Devuelve las rutas a persistir (una o varias).
+ */
+export async function materializarArchivosTrasDescarga(
+  localPath: string,
+  destDir: string,
+  filePrefix: string,
+): Promise<string[]> {
+  if (!extraerZipAnexosHabilitado() || !esArchivoZip(localPath)) {
+    return [localPath];
+  }
+  const extraidos = await extraerZipEnDirectorio(localPath, destDir, filePrefix);
+  await fs.rm(localPath, { force: true }).catch(() => {});
+  if (extraidos.length === 0) {
+    console.warn(`[comprasmx] ZIP sin archivos útiles: ${path.basename(localPath)}`);
+    return [];
+  }
+  console.log(
+    `[comprasmx] ZIP extraído (${path.basename(localPath)}): ${extraidos.length} archivo(s)`,
+  );
+  return extraidos;
 }
 
 export async function persistirAnexoDescargado(opts: {

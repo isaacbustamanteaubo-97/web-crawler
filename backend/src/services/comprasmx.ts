@@ -7,6 +7,7 @@ import {
   comprasmxAnexosBaseDir,
   expedienteParaNombreCarpeta,
   listarDocumentosConUbicacion,
+  materializarArchivosTrasDescarga,
   persistirAnexoDescargado,
   resolverDocumentoComprasmx,
 } from "./anexoStorage.js";
@@ -237,6 +238,10 @@ export type ComprasmxSnapshot = {
     coincidenciasListadoKeyword?: number;
     /** Coincidencias que no se procesaron por superar el límite. */
     detallesOmitidosPorLimite?: number;
+    /** Entidades que el cliente pidió pero no se pudieron marcar en el multiselect del portal. */
+    entidadesNoMarcadasEnPortal?: string[];
+    /** Entidades efectivamente marcadas en Compras MX (puede ser menor que `entidadesFederativas`). */
+    entidadesMarcadasEnPortal?: string[];
   };
   /** Valores de los inputs de fecha antes de Buscar (si están vacíos, el filtro de publicación no se aplicará). */
   valoresFormularioDetectados: {
@@ -1150,22 +1155,25 @@ async function descargarAnexosPorIconosDescargar(
     const prefix = String(saved + 1).padStart(2, "0");
     const dest = await guardarArchivoTrasClicDescarga(page, clickTarget, sessionDir, prefix, perFileMs);
     if (dest) {
-      const nombreEnDisco = path.basename(dest);
-      const persisted = await persistirAnexoDescargado({
-        localPath: dest,
-        numeroIdentificacion: expedienteListadoId,
-        nombreEnDisco,
-      });
-      if (persisted.storage === "drive") {
-        out.push({
-          titulo,
-          driveFileId: persisted.driveFileId,
-          nombreArchivo: persisted.nombreArchivo,
+      const materializados = await materializarArchivosTrasDescarga(dest, sessionDir, prefix);
+      for (const ruta of materializados) {
+        const nombreEnDisco = path.basename(ruta);
+        const persisted = await persistirAnexoDescargado({
+          localPath: ruta,
+          numeroIdentificacion: expedienteListadoId,
+          nombreEnDisco,
         });
-      } else {
-        out.push({ titulo, archivoLocal: persisted.archivoLocal, nombreArchivo: persisted.nombreArchivo });
+        if (persisted.storage === "drive") {
+          out.push({
+            titulo,
+            driveFileId: persisted.driveFileId,
+            nombreArchivo: persisted.nombreArchivo,
+          });
+        } else {
+          out.push({ titulo, archivoLocal: persisted.archivoLocal, nombreArchivo: persisted.nombreArchivo });
+        }
       }
-      saved += 1;
+      if (materializados.length > 0) saved += 1;
     }
   }
 
